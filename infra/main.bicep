@@ -4,6 +4,9 @@ param location string = resourceGroup().location
 @description('Nome estavel da API do WhatsApp.')
 param appName string = 'norium-whatsapp-api'
 
+@description('Container Apps Environment existente compartilhado com o Norium.')
+param managedEnvironmentName string
+
 @description('Referencia imutavel da imagem publicada no registro privado.')
 param containerImage string
 
@@ -42,7 +45,6 @@ param webhookHmacSecret string
 @minLength(32)
 param noriumWebhookSecret string
 
-var environmentName = 'cae-${appName}'
 var storageAccountName = 'stw${uniqueString(subscription().subscriptionId, resourceGroup().id)}'
 var fileShareName = 'whatsapp-data'
 var environmentStorageName = 'whatsappdata'
@@ -93,18 +95,8 @@ resource fileShare 'Microsoft.Storage/storageAccounts/fileServices/shares@2025-0
   }
 }
 
-resource managedEnvironment 'Microsoft.App/managedEnvironments@2025-01-01' = {
-  name: environmentName
-  location: location
-  tags: tags
-  properties: {
-    workloadProfiles: [
-      {
-        name: 'Consumption'
-        workloadProfileType: 'Consumption'
-      }
-    ]
-  }
+resource managedEnvironment 'Microsoft.App/managedEnvironments@2025-01-01' existing = {
+  name: managedEnvironmentName
 }
 
 resource environmentStorage 'Microsoft.App/managedEnvironments/storages@2023-05-01' = {
