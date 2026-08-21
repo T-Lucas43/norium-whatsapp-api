@@ -7,8 +7,7 @@ import pino from "pino";
 import pinoHttp from "pino-http";
 import QRCode from "qrcode";
 import { z, ZodError } from "zod";
-import { Client, createClient, type OpenWAClient } from "@open-wa/wa-automate";
-import { PuppeteerDriver } from "@open-wa/driver-puppeteer";
+import type { Client, OpenWAClient } from "@open-wa/wa-automate";
 import { config } from "./config.js";
 import { requireDestructiveConfirmation, requireRole } from "./security.js";
 import { WebhookDispatcher } from "./webhook.js";
@@ -19,9 +18,9 @@ const logger = pino({
   redact: {
     paths: [
       "req.headers.authorization",
-      "req.headers.x-api-key",
+      "req.headers['x-api-key']",
       "req.headers.cookie",
-      "res.headers.set-cookie",
+      "res.headers['set-cookie']",
       "*.sessionData",
       "*.qr",
     ],
@@ -298,6 +297,13 @@ async function launchWhatsApp(): Promise<void> {
   sessionState = "starting";
   lastError = null;
   try {
+    // Keep the HTTP API available even if an optional native OpenWA dependency
+    // cannot be loaded. This also lets Azure health probes report the real
+    // session state instead of restarting the entire container in a loop.
+    const [{ Client: OpenWAClientFacade, createClient }, { PuppeteerDriver }] = await Promise.all([
+      import("@open-wa/wa-automate"),
+      import("@open-wa/driver-puppeteer"),
+    ]);
     const core = await createClient({
       sessionId: config.sessionId,
       driver: new PuppeteerDriver(),
@@ -331,7 +337,7 @@ async function launchWhatsApp(): Promise<void> {
         sessionState = "disconnected";
       }
     });
-    const created = new Client({ client: core, transport: core.getTransport() });
+    const created = new OpenWAClientFacade({ client: core, transport: core.getTransport() });
     openwa = core;
     await created.start();
     await created.loaded();

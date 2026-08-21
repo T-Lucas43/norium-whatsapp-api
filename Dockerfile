@@ -16,7 +16,7 @@ ENV NODE_ENV=production \
     CHROME_PATH=/usr/bin/chromium \
     PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    chromium ca-certificates dumb-init fonts-liberation fonts-noto-color-emoji \
+    chromium ca-certificates dumb-init fonts-liberation fonts-noto-color-emoji zstd \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/package.json ./package.json
 COPY --from=build /src/node_modules ./node_modules
