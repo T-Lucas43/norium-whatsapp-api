@@ -1,0 +1,18 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+sessions/
+data/
+logs/
+*.data.json
+*.session.json
+*.log
+.DS_Store
+
+# managed
+**.data.json
+**.node-persist**
+**_IGNORE_**
+# end managed
