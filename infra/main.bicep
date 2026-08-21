@@ -4,11 +4,18 @@ param location string = resourceGroup().location
 @description('Nome estavel da API do WhatsApp.')
 param appName string = 'norium-whatsapp-api'
 
-@description('Nome do Azure Container Registry criado antes da imagem.')
-param registryName string
-
-@description('Referencia imutavel da imagem publicada no ACR.')
+@description('Referencia imutavel da imagem publicada no registro privado.')
 param containerImage string
+
+@description('Servidor do registro privado de imagens.')
+param registryServer string = 'ghcr.io'
+
+@description('Usuario do registro privado de imagens.')
+param registryUsername string = 'T-Lucas43'
+
+@secure()
+@description('Token de leitura do registro privado, recuperado do cofre do Container Apps.')
+param registryPassword string
 
 @description('Callback HTTPS do Norium que recebe eventos do WhatsApp.')
 param noriumWebhookUrl string
@@ -40,16 +47,11 @@ var storageAccountName = 'stw${uniqueString(subscription().subscriptionId, resou
 var fileShareName = 'whatsapp-data'
 var environmentStorageName = 'whatsappdata'
 var publicUrl = 'https://${appName}.${managedEnvironment.properties.defaultDomain}'
-var registryCredentials = registry.listCredentials()
 var tags = {
   application: 'norium-whatsapp-api'
   environment: 'production'
   managedBy: 'bicep'
   dataClassification: 'confidential'
-}
-
-resource registry 'Microsoft.ContainerRegistry/registries@2023-07-01' existing = {
-  name: registryName
 }
 
 resource storageAccount 'Microsoft.Storage/storageAccounts@2025-06-01' = {
@@ -139,15 +141,15 @@ resource containerApp 'Microsoft.App/containerApps@2025-01-01' = {
       }
       registries: [
         {
-          server: registry.properties.loginServer
-          username: registryCredentials.username
-          passwordSecretRef: 'acr-password'
+          server: registryServer
+          username: registryUsername
+          passwordSecretRef: 'ghcr-token'
         }
       ]
       secrets: [
         {
-          name: 'acr-password'
-          value: registryCredentials.passwords[0].value
+          name: 'ghcr-token'
+          value: registryPassword
         }
         {
           name: 'norium-api-key'
@@ -249,5 +251,4 @@ resource containerApp 'Microsoft.App/containerApps@2025-01-01' = {
 
 output containerAppName string = containerApp.name
 output publicUrl string = publicUrl
-output registryLoginServer string = registry.properties.loginServer
 output persistentDataPath string = '/data'

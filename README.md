@@ -35,10 +35,10 @@ Copie `.env.example` para `.env` apenas no seu ambiente local. Segredos nunca de
 
 ## Azure
 
-Os templates em `infra/` criam um ACR Basic privado, Azure Files cifrado em
-repouso, um Container Apps Environment e a API com exatamente uma réplica. O
-deploy usa uma imagem identificada pelo SHA do commit; QR, sessão e outbox são
-mantidos em `/data` mesmo quando a revisão é substituída.
+O template em `infra/` cria Azure Files cifrado em repouso, um Container Apps
+Environment e a API com exatamente uma réplica. O deploy usa uma imagem privada
+no GHCR identificada pelo SHA do commit; QR, sessão e outbox são mantidos em
+`/data` mesmo quando a revisão é substituída.
 
 O pipeline de produção é iniciado pelo repositório do Norium porque a identidade
 OIDC já autorizada na assinatura está vinculada a ele. O código, a imagem e toda
