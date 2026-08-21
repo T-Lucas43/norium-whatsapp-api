@@ -5,6 +5,7 @@ import rateLimit from "express-rate-limit";
 import helmet from "helmet";
 import pino from "pino";
 import pinoHttp from "pino-http";
+import QRCode from "qrcode";
 import { z, ZodError } from "zod";
 import { Client, createClient, type OpenWAClient } from "@open-wa/wa-automate";
 import { PuppeteerDriver } from "@open-wa/driver-puppeteer";
@@ -19,7 +20,6 @@ const logger = pino({
     paths: [
       "req.headers.authorization",
       "req.headers.x-api-key",
-      "req.headers.client-token",
       "req.headers.cookie",
       "res.headers.set-cookie",
       "*.sessionData",
@@ -183,6 +183,15 @@ app.get("/v1/groups", requireRole("norium"), async (_request, response) => {
   const chats = await readyClient().getAllChats();
   response.json(chats.filter((chat: any) => Boolean(chat.isGroup || String(chat.id || "").endsWith("@g.us"))));
 });
+app.get("/v1/contacts/:id/profile-picture", requireRole("norium"), async (request, response) => {
+  const contactId = normalizeChatId(String(request.params.id || ""));
+  const value = await (readyClient() as any).getProfilePic(contactId);
+  response.json({ value: value || null });
+});
+app.get("/v1/groups/:id", requireRole("norium"), async (request, response) => {
+  const groupId = normalizeChatId(String(request.params.id || ""));
+  response.json(await (readyClient() as any).getGroupInfo(groupId));
+});
 
 app.get("/v1/openwa/methods", requireRole("admin"), (_request, response) => {
   const current = readyClient() as unknown as Record<string, unknown>;
@@ -222,31 +231,6 @@ app.post("/v1/openwa/:method", requireRole("admin"), async (request, response, n
     next(error);
   }
 });
-
-// Compatibilidade isolada para substituir o gateway Z-API usado atualmente pelo Norium.
-const compatibility = express.Router();
-compatibility.use(requireRole("norium"));
-compatibility.get("/status-connection", (_request, response) => response.json({ connected: sessionState === "connected", status: sessionState === "connected" ? "CONNECTED" : sessionState.toUpperCase() }));
-compatibility.get("/qr-code", (_request, response) => response.json({ value: sessionState === "qr" ? latestQr : null }));
-compatibility.get("/chats", async (_request, response) => response.json(await readyClient().getAllChats()));
-compatibility.get("/contacts", async (_request, response) => response.json(await readyClient().getAllContacts()));
-compatibility.get("/profile-picture", async (request, response) => response.json({ value: await (readyClient() as any).getProfilePic(normalizeChatId(String(request.query.phone || ""))) }));
-compatibility.get("/group-metadata/:id", async (request, response) => response.json(await (readyClient() as any).getGroupInfo(String(request.params.id || ""))));
-compatibility.post("/send-text", sendLimiter, async (request, response) => {
-  const body = z.object({ phone: z.string(), message: z.string().min(1).max(65_536) }).parse(request.body);
-  const result = await idempotent(request, () => (readyClient() as any).sendText(normalizeChatId(body.phone), body.message));
-  response.status(201).json({ sent: Boolean(result), messageId: result });
-});
-compatibility.post(["/send-image", "/send-video", "/send-audio", "/send-document", "/send-document/:extension"], sendLimiter, async (request, response) => {
-  const body = z.record(z.string(), z.unknown()).parse(request.body);
-  const phone = normalizeChatId(String(body.phone || ""));
-  const media = String(body.image || body.video || body.audio || body.document || "");
-  const filename = String(body.fileName || `arquivo.${request.params.extension || "bin"}`);
-  const caption = String(body.caption || "");
-  const result = await (readyClient() as any).sendFile(phone, media, filename, caption);
-  response.status(201).json({ sent: Boolean(result), messageId: result });
-});
-app.use("/v1/compat", compatibility);
 
 app.use((_request, response) => response.status(404).json({ error: "not_found" }));
 app.use((error: unknown, _request: Request, response: Response, _next: NextFunction) => {
@@ -301,8 +285,17 @@ async function launchWhatsApp(): Promise<void> {
       ...(config.chromePath ? { executablePath: config.chromePath } : {}),
     });
     core.events.on("launch.auth.qr.generated", (payload) => {
-      latestQr = payload.details?.qr || null;
-      sessionState = latestQr ? "qr" : sessionState;
+      const rawQr = payload.details?.qr || "";
+      if (!rawQr) return;
+      void QRCode.toDataURL(rawQr, { errorCorrectionLevel: "M", margin: 2, width: 360 })
+        .then((dataUrl) => {
+          latestQr = dataUrl;
+          sessionState = "qr";
+        })
+        .catch((error) => {
+          lastError = "Falha ao renderizar o QR Code.";
+          logger.warn({ err: error }, "QR Code do OpenWA nao foi renderizado");
+        });
     });
     core.events.on("session.state.changed", (payload) => {
       if (payload.details?.next === "DISCONNECTED" || payload.details?.next === "STOPPED") {
@@ -328,24 +321,29 @@ async function launchWhatsApp(): Promise<void> {
   }
 }
 
-await persistence.restore().catch((error) => logger.warn({ err: error }, "Persistencia anterior indisponivel"));
-const persistenceTimer = setInterval(
-  () => void persistence.save().catch((error) => logger.warn({ err: error }, "Falha ao sincronizar persistencia")),
-  config.persistenceIntervalMs,
-);
-persistenceTimer.unref();
+let persistenceTimer: NodeJS.Timeout | null = null;
+
+async function bootstrapWhatsApp(): Promise<void> {
+  await persistence.restore().catch((error) => logger.warn({ err: error }, "Persistencia anterior indisponivel"));
+  persistenceTimer = setInterval(
+    () => void persistence.save().catch((error) => logger.warn({ err: error }, "Falha ao sincronizar persistencia")),
+    config.persistenceIntervalMs,
+  );
+  persistenceTimer.unref();
+  launchPromise = launchWhatsApp();
+}
 
 const server = app.listen(config.port, "0.0.0.0", () => {
   logger.info({ port: config.port, sessionId: config.sessionId }, "Norium WhatsApp API pronta");
   void dispatcher.drain();
-  launchPromise = launchWhatsApp();
+  void bootstrapWhatsApp();
 });
 
 async function shutdown(signal: string): Promise<void> {
   logger.info({ signal }, "Encerrando API WhatsApp");
   server.close();
   if (openwa) await openwa.stop(signal).catch(() => undefined);
-  clearInterval(persistenceTimer);
+  if (persistenceTimer) clearInterval(persistenceTimer);
   await persistence.save().catch(() => undefined);
   process.exit(0);
 }

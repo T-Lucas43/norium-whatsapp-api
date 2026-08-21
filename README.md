@@ -17,9 +17,8 @@ API privada baseada em `@open-wa/wa-automate`, criada para substituir o gateway 
 
 - `GET /health` e `GET /ready` — sondas da plataforma.
 - `/v1/session/*` — status, QR, reconexão e logout.
-- `/v1/messages/*`, `/v1/chats`, `/v1/contacts`, `/v1/groups` — operações seguras usadas pelo Norium.
+- `/v1/messages/*`, `/v1/chats`, `/v1/contacts`, `/v1/groups` — integração nativa usada pelo Norium, incluindo fotos e metadados de grupos.
 - `/v1/openwa/:method` — acesso administrativo aos métodos públicos do cliente OpenWA. Corpo: `{ "args": [] }`.
-- `/v1/compat/*` — compatibilidade privada com o contrato de gateway já usado pelo Norium.
 
 Autentique com `Authorization: Bearer <chave>` ou `X-API-Key`. A API administrativa exige `ADMIN_API_KEY`; as demais aceitam `NORIUM_API_KEY`.
 

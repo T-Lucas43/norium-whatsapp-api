@@ -16,7 +16,7 @@ function constantTimeEqual(received: string, expected: string): boolean {
 function receivedKey(request: Request): string {
   const authorization = request.header("authorization") || "";
   if (authorization.toLowerCase().startsWith("bearer ")) return authorization.slice(7).trim();
-  return (request.header("x-api-key") || request.header("client-token") || "").trim();
+  return (request.header("x-api-key") || "").trim();
 }
 
 export function requireRole(role: ApiRole) {
