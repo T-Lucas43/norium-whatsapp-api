@@ -119,6 +119,35 @@ async function idempotent<T>(request: Request, operation: () => Promise<T>): Pro
   return payload;
 }
 
+app.get("/", (_request, response) => {
+  response.type("html").send(`<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Norium WhatsApp API</title>
+    <style>
+      :root { color-scheme: dark; font-family: Inter, system-ui, sans-serif; }
+      * { box-sizing: border-box; }
+      body { margin: 0; min-height: 100dvh; display: grid; place-items: center; padding: 24px; background: #07090c; color: #f8fafc; }
+      main { width: min(560px, 100%); padding: 32px; border: 1px solid #26303a; border-radius: 24px; background: #0d1117; box-shadow: 0 24px 80px #0008; }
+      .status { display: inline-flex; align-items: center; gap: 8px; padding: 7px 12px; border-radius: 999px; background: #0d2a1e; color: #6ee7a8; font-weight: 800; font-size: 13px; }
+      .dot { width: 8px; height: 8px; border-radius: 50%; background: #22c55e; box-shadow: 0 0 16px #22c55e; }
+      h1 { margin: 22px 0 10px; font-size: clamp(28px, 7vw, 42px); letter-spacing: -0.04em; }
+      p { margin: 0; color: #a8b3c2; line-height: 1.7; }
+      code { color: #67e8f9; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <span class="status"><span class="dot"></span>API online</span>
+      <h1>Norium WhatsApp API</h1>
+      <p>Serviço privado ativo. A autenticação e o QR Code são acessados com segurança dentro do Norium. Monitoramento técnico disponível em <code>/health</code>.</p>
+    </main>
+  </body>
+</html>`);
+});
+
 app.get("/health", (_request, response) => {
   response.json({ status: "ok", service: "norium-whatsapp-api", session: sessionState, uptime: Math.round(process.uptime()) });
 });
