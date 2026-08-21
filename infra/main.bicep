@@ -48,7 +48,7 @@ param webhookHmacSecret string
 @minLength(32)
 param noriumWebhookSecret string
 
-var storageAccountName = 'stw${uniqueString(subscription().subscriptionId, resourceGroup().id)}'
+var storageAccountName = 'stw${uniqueString(subscription().subscriptionId, resourceGroup().id, location)}'
 var blobContainerName = 'whatsapp'
 var persistenceSas = storageAccount.listAccountSas('2025-06-01', {
   signedServices: 'b'
