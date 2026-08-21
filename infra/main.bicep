@@ -4,8 +4,11 @@ param location string = resourceGroup().location
 @description('Nome estavel da API do WhatsApp.')
 param appName string = 'norium-whatsapp-api'
 
-@description('Container Apps Environment existente compartilhado com o Norium.')
-param managedEnvironmentName string
+@description('ID completo do Container Apps Environment existente do Norium.')
+param managedEnvironmentId string
+
+@description('Expiracao da credencial HTTPS usada apenas no blob de persistencia.')
+param persistenceSasExpiry string = dateTimeAdd(utcNow(), 'P5Y')
 
 @description('Referencia imutavel da imagem publicada no registro privado.')
 param containerImage string
@@ -46,9 +49,15 @@ param webhookHmacSecret string
 param noriumWebhookSecret string
 
 var storageAccountName = 'stw${uniqueString(subscription().subscriptionId, resourceGroup().id)}'
-var fileShareName = 'whatsapp-data'
-var environmentStorageName = 'whatsappdata'
-var publicUrl = 'https://${appName}.${managedEnvironment.properties.defaultDomain}'
+var blobContainerName = 'whatsapp'
+var persistenceSas = storageAccount.listAccountSas('2025-06-01', {
+  signedServices: 'b'
+  signedResourceTypes: 'co'
+  signedPermission: 'rwc'
+  signedProtocol: 'https'
+  signedExpiry: persistenceSasExpiry
+}).accountSasToken
+var persistenceBlobUrl = '${storageAccount.properties.primaryEndpoints.blob}${blobContainerName}/session.json?${persistenceSas}'
 var tags = {
   application: 'norium-whatsapp-api'
   environment: 'production'
@@ -80,35 +89,22 @@ resource storageAccount 'Microsoft.Storage/storageAccounts@2025-06-01' = {
   }
 }
 
-resource fileService 'Microsoft.Storage/storageAccounts/fileServices@2025-06-01' = {
+resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2025-06-01' = {
   parent: storageAccount
   name: 'default'
-  properties: {}
-}
-
-resource fileShare 'Microsoft.Storage/storageAccounts/fileServices/shares@2025-06-01' = {
-  parent: fileService
-  name: fileShareName
   properties: {
-    enabledProtocols: 'SMB'
-    shareQuota: 5
+    deleteRetentionPolicy: {
+      enabled: true
+      days: 7
+    }
   }
 }
 
-resource managedEnvironment 'Microsoft.App/managedEnvironments@2025-01-01' existing = {
-  name: managedEnvironmentName
-}
-
-resource environmentStorage 'Microsoft.App/managedEnvironments/storages@2023-05-01' = {
-  parent: managedEnvironment
-  name: environmentStorageName
+resource blobContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2025-06-01' = {
+  parent: blobService
+  name: blobContainerName
   properties: {
-    azureFile: {
-      accountName: storageAccount.name
-      accountKey: storageAccount.listKeys().keys[0].value
-      shareName: fileShare.name
-      accessMode: 'ReadWrite'
-    }
+    publicAccess: 'None'
   }
 }
 
@@ -120,7 +116,7 @@ resource containerApp 'Microsoft.App/containerApps@2025-01-01' = {
     type: 'SystemAssigned'
   }
   properties: {
-    managedEnvironmentId: managedEnvironment.id
+    managedEnvironmentId: managedEnvironmentId
     workloadProfileName: 'Consumption'
     configuration: {
       activeRevisionsMode: 'Single'
@@ -159,6 +155,10 @@ resource containerApp 'Microsoft.App/containerApps@2025-01-01' = {
           name: 'norium-webhook-secret'
           value: noriumWebhookSecret
         }
+        {
+          name: 'persistence-blob-url'
+          value: persistenceBlobUrl
+        }
       ]
     }
     template: {
@@ -173,6 +173,9 @@ resource containerApp 'Microsoft.App/containerApps@2025-01-01' = {
             { name: 'SESSION_ID', value: 'norium' }
             { name: 'SESSION_DATA_PATH', value: '/data/sessions' }
             { name: 'OUTBOX_PATH', value: '/data/outbox' }
+            { name: 'PERSISTENCE_ROOT', value: '/data' }
+            { name: 'PERSISTENCE_BLOB_URL', secretRef: 'persistence-blob-url' }
+            { name: 'PERSISTENCE_INTERVAL_SECONDS', value: '30' }
             { name: 'CHROME_PATH', value: '/usr/bin/chromium' }
             { name: 'PUPPETEER_SKIP_CHROMIUM_DOWNLOAD', value: 'true' }
             { name: 'NORIUM_API_KEY', secretRef: 'norium-api-key' }
@@ -192,12 +195,6 @@ resource containerApp 'Microsoft.App/containerApps@2025-01-01' = {
             cpu: json('1.0')
             memory: '2Gi'
           }
-          volumeMounts: [
-            {
-              volumeName: 'whatsapp-data'
-              mountPath: '/data'
-            }
-          ]
           probes: [
             {
               type: 'Startup'
@@ -230,17 +227,10 @@ resource containerApp 'Microsoft.App/containerApps@2025-01-01' = {
         minReplicas: 1
         maxReplicas: 1
       }
-      volumes: [
-        {
-          name: 'whatsapp-data'
-          storageType: 'AzureFile'
-          storageName: environmentStorage.name
-        }
-      ]
     }
   }
 }
 
 output containerAppName string = containerApp.name
-output publicUrl string = publicUrl
+output publicUrl string = 'https://${containerApp.properties.configuration.ingress.fqdn}'
 output persistentDataPath string = '/data'

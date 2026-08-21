@@ -16,6 +16,7 @@ function secret(name: string): string {
 }
 
 const sessionDataPath = resolve(process.env.SESSION_DATA_PATH || "./data/sessions");
+const persistenceRoot = resolve(process.env.PERSISTENCE_ROOT || "./data");
 mkdirSync(sessionDataPath, { recursive: true, mode: 0o700 });
 
 export const config = {
@@ -23,6 +24,9 @@ export const config = {
   port: integerEnv("PORT", 8080, 1, 65535),
   sessionId: (process.env.SESSION_ID || "norium").replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 80),
   sessionDataPath,
+  persistenceRoot,
+  persistenceBlobUrl: (process.env.PERSISTENCE_BLOB_URL || "").trim(),
+  persistenceIntervalMs: integerEnv("PERSISTENCE_INTERVAL_SECONDS", 30, 10, 300) * 1000,
   chromePath: (process.env.CHROME_PATH || "").trim(),
   noriumApiKey: secret("NORIUM_API_KEY"),
   adminApiKey: secret("ADMIN_API_KEY"),
@@ -44,6 +48,10 @@ export const config = {
 if (config.environment === "production" && config.noriumWebhookUrl) {
   const url = new URL(config.noriumWebhookUrl);
   if (url.protocol !== "https:") throw new Error("NORIUM_WEBHOOK_URL deve usar HTTPS em producao.");
+}
+if (config.environment === "production" && config.persistenceBlobUrl) {
+  const url = new URL(config.persistenceBlobUrl);
+  if (url.protocol !== "https:") throw new Error("PERSISTENCE_BLOB_URL deve usar HTTPS em producao.");
 }
 
 mkdirSync(config.outboxPath, { recursive: true, mode: 0o700 });

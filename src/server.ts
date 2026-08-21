@@ -11,6 +11,7 @@ import { PuppeteerDriver } from "@open-wa/driver-puppeteer";
 import { config } from "./config.js";
 import { requireDestructiveConfirmation, requireRole } from "./security.js";
 import { WebhookDispatcher } from "./webhook.js";
+import { BlobPersistence } from "./persistence.js";
 
 const logger = pino({
   level: config.logLevel,
@@ -30,6 +31,7 @@ const logger = pino({
 
 const app = express();
 const dispatcher = new WebhookDispatcher();
+const persistence = new BlobPersistence();
 let client: Client | null = null;
 let openwa: OpenWAClient | null = null;
 let launchPromise: Promise<void> | null = null;
@@ -326,6 +328,13 @@ async function launchWhatsApp(): Promise<void> {
   }
 }
 
+await persistence.restore().catch((error) => logger.warn({ err: error }, "Persistencia anterior indisponivel"));
+const persistenceTimer = setInterval(
+  () => void persistence.save().catch((error) => logger.warn({ err: error }, "Falha ao sincronizar persistencia")),
+  config.persistenceIntervalMs,
+);
+persistenceTimer.unref();
+
 const server = app.listen(config.port, "0.0.0.0", () => {
   logger.info({ port: config.port, sessionId: config.sessionId }, "Norium WhatsApp API pronta");
   void dispatcher.drain();
@@ -336,6 +345,8 @@ async function shutdown(signal: string): Promise<void> {
   logger.info({ signal }, "Encerrando API WhatsApp");
   server.close();
   if (openwa) await openwa.stop(signal).catch(() => undefined);
+  clearInterval(persistenceTimer);
+  await persistence.save().catch(() => undefined);
   process.exit(0);
 }
 
