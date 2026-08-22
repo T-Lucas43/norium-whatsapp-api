@@ -54,6 +54,66 @@ const QR_SNAPSHOT_SCRIPT = `(() => {
   try { return qrCanvas.toDataURL('image/png'); } catch { return null; }
 })()`;
 
+const CURRENT_WA_COMPATIBILITY_SCRIPT = `(() => {
+  if (!window.WAPI) return false;
+
+  const getSocket = () => window.Store?.State?.Socket
+    || window.Store?.State?.default
+    || (() => { try { return window.require?.('WAWebSocketModel')?.Socket; } catch { return null; } })();
+  const readState = () => {
+    const socket = getSocket();
+    const socketState = socket?.state || socket?.stream;
+    if (typeof socketState === 'string' && socketState) return socketState;
+    const authenticated = Boolean(
+      window.WA_AUTHENTICATED
+      || document.querySelector('#pane-side')
+      || document.querySelector('[data-testid="chat-list-search"]')
+      || (window.Store?.Chat && !document.querySelector('[data-ref]'))
+    );
+    return authenticated ? 'CONNECTED' : 'UNPAIRED';
+  };
+
+  window.__NORIUM_STATE_CALLBACKS__ = window.__NORIUM_STATE_CALLBACKS__ || new Set();
+  window.WAPI.onStateChanged = function (callback) {
+    window.__NORIUM_STATE_CALLBACKS__.add(callback);
+    const socket = getSocket();
+    if (socket?.on && !socket.__NORIUM_STATE_BRIDGE__) {
+      const emit = (payload) => {
+        const next = payload?.state || payload?.stream || readState();
+        window.__NORIUM_STATE_CALLBACKS__.forEach((listener) => {
+          try { listener(next); } catch {}
+        });
+      };
+      socket.on('change:state', emit);
+      socket.on('change:stream', emit);
+      socket.__NORIUM_STATE_BRIDGE__ = true;
+    }
+    if (!window.__NORIUM_STATE_TIMER__) {
+      let previous = readState();
+      window.__NORIUM_STATE_TIMER__ = setInterval(() => {
+        const next = readState();
+        if (next === previous) return;
+        previous = next;
+        window.__NORIUM_STATE_CALLBACKS__.forEach((listener) => {
+          try { listener(next); } catch {}
+        });
+      }, 1000);
+    }
+    return true;
+  };
+  window.WAPI.getState = readState;
+  window.WAPI.getConnectionState = readState;
+  window.WAPI.getHostNumber = function () {
+    const value = window.Store?.Me?.me?.user
+      || window.Store?.Me?.wid?.user
+      || window.Store?.Me?.attributes?.wid?.user
+      || localStorage.getItem('last-wid-md')
+      || '';
+    return String(value).replace(/["']/g, '').split('@')[0].split(':')[0];
+  };
+  return true;
+})()`;
+
 if (!channel) throw new Error("Canal IPC do OpenWA indisponivel.");
 
 function serializable(value: unknown): unknown {
@@ -82,6 +142,24 @@ function startQrPoller(openwa: OpenWAClient): void {
       .catch(() => undefined);
   }, 1_500);
   qrPoller.unref();
+}
+
+async function installCurrentWACompatibility(openwa: OpenWAClient): Promise<void> {
+  const installed = await openwa.evaluateScript<boolean>(CURRENT_WA_COMPATIBILITY_SCRIPT);
+  if (!installed) throw new Error("Runtime do WhatsApp nao estava disponivel para compatibilidade.");
+}
+
+function keepCompatibilityAfterOpenWAReinjection(openwa: OpenWAClient): void {
+  const transport = openwa.getTransport() as unknown as Record<string, unknown>;
+  for (const methodName of ["performRuntimeInjection", "applyLivePatchArtifacts", "applyDeferredInitPatchArtifact"]) {
+    const original = transport[methodName];
+    if (typeof original !== "function") continue;
+    transport[methodName] = async (...args: unknown[]) => {
+      const result = await Reflect.apply(original, transport, args);
+      await installCurrentWACompatibility(openwa);
+      return result;
+    };
+  }
 }
 
 function availableMethods(instance: Client): string[] {
@@ -166,6 +244,7 @@ async function launch(): Promise<void> {
       ...(configuration.chromePath ? { executablePath: configuration.chromePath } : {}),
     });
     core = createdCore;
+    keepCompatibilityAfterOpenWAReinjection(createdCore);
 
     createdCore.events.on("launch.auth.qr.generated", (event: OpenWAEvent<{ qr?: string }>) => {
       const value = event.details?.qr;
