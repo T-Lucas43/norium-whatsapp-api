@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { Worker } from "node:worker_threads";
 import cors from "cors";
 import express, { type NextFunction, type Request, type Response } from "express";
 import rateLimit from "express-rate-limit";
@@ -7,7 +8,6 @@ import pino from "pino";
 import pinoHttp from "pino-http";
 import QRCode from "qrcode";
 import { z, ZodError } from "zod";
-import type { Client, OpenWAClient } from "@open-wa/wa-automate";
 import { config } from "./config.js";
 import { requireDestructiveConfirmation, requireRole } from "./security.js";
 import { WebhookDispatcher } from "./webhook.js";
@@ -31,13 +31,18 @@ const logger = pino({
 const app = express();
 const dispatcher = new WebhookDispatcher();
 const persistence = new BlobPersistence();
-let client: Client | null = null;
-let openwa: OpenWAClient | null = null;
+let openwaWorker: Worker | null = null;
 let launchPromise: Promise<void> | null = null;
 let latestQr: string | null = null;
 let sessionState: "starting" | "qr" | "connected" | "disconnected" | "error" = "starting";
 let lastError: string | null = null;
 let connectedAt: string | null = null;
+let workerRequestSequence = 0;
+const workerRequests = new Map<number, {
+  resolve: (value: unknown) => void;
+  reject: (error: Error) => void;
+  timer: NodeJS.Timeout;
+}>();
 
 app.disable("x-powered-by");
 app.set("trust proxy", config.trustProxy);
@@ -89,13 +94,40 @@ function normalizeChatId(value: string): string {
   return `${digits}@c.us`;
 }
 
-function readyClient(): Client {
-  if (!client || sessionState !== "connected") {
+function assertConnected(): void {
+  if (!openwaWorker || sessionState !== "connected") {
     const error = new Error("WhatsApp ainda nao esta conectado.") as Error & { status?: number };
     error.status = 503;
     throw error;
   }
-  return client;
+}
+
+function rejectWorkerRequests(message: string): void {
+  for (const pending of workerRequests.values()) {
+    clearTimeout(pending.timer);
+    pending.reject(new Error(message));
+  }
+  workerRequests.clear();
+}
+
+async function invokeOpenWA<T>(method: string, args: unknown[] = [], timeoutMs = 60_000): Promise<T> {
+  assertConnected();
+  const target = openwaWorker;
+  if (!target) throw new Error("Processo do WhatsApp indisponivel.");
+  const id = ++workerRequestSequence;
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      workerRequests.delete(id);
+      reject(new Error(`Operacao ${method} excedeu o tempo limite.`));
+    }, timeoutMs);
+    timer.unref();
+    workerRequests.set(id, {
+      resolve: resolve as (value: unknown) => void,
+      reject,
+      timer,
+    });
+    target.postMessage({ type: "invoke", id, method, args });
+  });
 }
 
 function idempotencyKey(request: Request): string | null {
@@ -157,8 +189,8 @@ app.get("/ready", (_request, response) => {
 
 app.get("/v1/session/status", requireRole("norium"), async (_request, response) => {
   let hostNumber: string | null = null;
-  if (client && sessionState === "connected") {
-    hostNumber = String(await (client as unknown as { getHostNumber(): Promise<string> }).getHostNumber().catch(() => "")) || null;
+  if (openwaWorker && sessionState === "connected") {
+    hostNumber = String(await invokeOpenWA<string>("getHostNumber", [], 10_000).catch(() => "")) || null;
   }
   response.json({ sessionId: config.sessionId, state: sessionState, connected: sessionState === "connected", connectedAt, hostNumber, lastError });
 });
@@ -174,14 +206,10 @@ app.post("/v1/session/reconnect", requireRole("admin"), async (_request, respons
 });
 
 app.post("/v1/session/logout", requireRole("admin"), requireDestructiveConfirmation, async (_request, response) => {
-  if (client) {
-    await (client as unknown as { evaluate: (fn: () => unknown, arg: undefined) => Promise<unknown> })
-      .evaluate(() => (globalThis as unknown as { WAPI?: { logout?: () => unknown } }).WAPI?.logout?.(), undefined)
-      .catch(() => undefined);
+  if (openwaWorker && sessionState === "connected") {
+    await invokeOpenWA("logout", [false], 20_000).catch(() => undefined);
   }
-  if (openwa) await openwa.stop("logout").catch(() => undefined);
-  client = null;
-  openwa = null;
+  await stopOpenWAWorker();
   sessionState = "disconnected";
   latestQr = null;
   response.json({ loggedOut: true });
@@ -189,7 +217,7 @@ app.post("/v1/session/logout", requireRole("admin"), requireDestructiveConfirmat
 
 app.post("/v1/messages/text", requireRole("norium"), sendLimiter, async (request, response) => {
   const body = textPayload.parse(request.body);
-  const result = await idempotent(request, () => (readyClient() as any).sendText(normalizeChatId(body.to), body.text));
+  const result = await idempotent(request, () => invokeOpenWA("sendText", [normalizeChatId(body.to), body.text], 30_000));
   response.json({ sent: Boolean(result), messageId: result });
 });
 
@@ -199,39 +227,30 @@ app.post("/v1/messages/media", requireRole("norium"), sendLimiter, async (reques
     response.status(422).json({ error: "invalid_media", message: "Use Data URL ou caminho relativo; URLs remotas exigem a API administrativa." });
     return;
   }
-  const result = await idempotent(request, () => (readyClient() as any).sendFile(
+  const result = await idempotent(request, () => invokeOpenWA("sendFile", [
     normalizeChatId(body.to), body.data, body.filename, body.caption,
-  ));
+  ], 90_000));
   response.json({ sent: Boolean(result), messageId: result });
 });
 
-app.get("/v1/chats", requireRole("norium"), async (_request, response) => response.json(await readyClient().getAllChats()));
-app.get("/v1/contacts", requireRole("norium"), async (_request, response) => response.json(await readyClient().getAllContacts()));
+app.get("/v1/chats", requireRole("norium"), async (_request, response) => response.json(await invokeOpenWA("getAllChats")));
+app.get("/v1/contacts", requireRole("norium"), async (_request, response) => response.json(await invokeOpenWA("getAllContacts")));
 app.get("/v1/groups", requireRole("norium"), async (_request, response) => {
-  const chats = await readyClient().getAllChats();
+  const chats = await invokeOpenWA<any[]>("getAllChats");
   response.json(chats.filter((chat: any) => Boolean(chat.isGroup || String(chat.id || "").endsWith("@g.us"))));
 });
 app.get("/v1/contacts/:id/profile-picture", requireRole("norium"), async (request, response) => {
   const contactId = normalizeChatId(String(request.params.id || ""));
-  const value = await (readyClient() as any).getProfilePic(contactId);
+  const value = await invokeOpenWA("getProfilePic", [contactId]);
   response.json({ value: value || null });
 });
 app.get("/v1/groups/:id", requireRole("norium"), async (request, response) => {
   const groupId = normalizeChatId(String(request.params.id || ""));
-  response.json(await (readyClient() as any).getGroupInfo(groupId));
+  response.json(await invokeOpenWA("getGroupInfo", [groupId]));
 });
 
-app.get("/v1/openwa/methods", requireRole("admin"), (_request, response) => {
-  const current = readyClient() as unknown as Record<string, unknown>;
-  const methods = new Set<string>();
-  let prototype = Object.getPrototypeOf(current) as object | null;
-  while (prototype && prototype !== Object.prototype) {
-    for (const name of Object.getOwnPropertyNames(prototype)) {
-      if (!name.startsWith("_") && typeof current[name] === "function") methods.add(name);
-    }
-    prototype = Object.getPrototypeOf(prototype) as object | null;
-  }
-  response.json({ methods: [...methods].sort() });
+app.get("/v1/openwa/methods", requireRole("admin"), async (_request, response) => {
+  response.json({ methods: await invokeOpenWA<string[]>("__methods", [], 15_000) });
 });
 
 const destructiveMethods = new Set(["logout", "kill", "deleteChat", "deleteMessage", "clearChat", "leaveGroup", "deleteAllStatus"]);
@@ -246,14 +265,8 @@ app.post("/v1/openwa/:method", requireRole("admin"), async (request, response, n
       response.status(428).json({ error: "confirmation_required", message: "Confirme a operacao destrutiva no cabecalho." });
       return;
     }
-    const instance = readyClient() as unknown as Record<string, unknown>;
-    const target = instance[method];
-    if (typeof target !== "function") {
-      response.status(404).json({ error: "unknown_method" });
-      return;
-    }
     const { args } = rawPayload.parse(request.body);
-    const result = await Reflect.apply(target, instance, args);
+    const result = await invokeOpenWA(method, args, 120_000);
     response.json({ method, result });
   } catch (error) {
     next(error);
@@ -274,79 +287,98 @@ app.use((error: unknown, _request: Request, response: Response, _next: NextFunct
   });
 });
 
-async function registerEvents(openwaClient: Client): Promise<void> {
-  const dynamic = openwaClient as unknown as Record<string, unknown>;
-  const listeners: Array<[string, string]> = [
-    ["onMessage", "message"], ["onAnyMessage", "any-message"], ["onAck", "ack"],
-    ["onStateChanged", "state"], ["onAddedToGroup", "group-added"],
-    ["onParticipantsChanged", "group-participants"], ["onIncomingCall", "incoming-call"],
-    ["onButton", "button"], ["onPollVote", "poll-vote"], ["onReaction", "reaction"],
-  ];
-  for (const [method, eventName] of listeners) {
-    const target = dynamic[method];
-    if (typeof target !== "function") continue;
-    try {
-      await Reflect.apply(target, dynamic, [(payload: unknown) => void dispatcher.enqueue(eventName, payload)]);
-    } catch (error) {
-      logger.warn({ err: error, method }, "Listener OpenWA indisponivel");
-    }
-  }
+async function stopOpenWAWorker(): Promise<void> {
+  const target = openwaWorker;
+  openwaWorker = null;
+  rejectWorkerRequests("Processo do WhatsApp reiniciado.");
+  if (target) await target.terminate().catch(() => undefined);
 }
 
 async function launchWhatsApp(): Promise<void> {
+  await stopOpenWAWorker();
   sessionState = "starting";
   lastError = null;
+  latestQr = null;
   try {
-    // Keep the HTTP API available even if an optional native OpenWA dependency
-    // cannot be loaded. This also lets Azure health probes report the real
-    // session state instead of restarting the entire container in a loop.
-    const [{ Client: OpenWAClientFacade, createClient }, { PuppeteerDriver }] = await Promise.all([
-      import("@open-wa/wa-automate"),
-      import("@open-wa/driver-puppeteer"),
-    ]);
-    const core = await createClient({
-      sessionId: config.sessionId,
-      driver: new PuppeteerDriver(),
-      sessionDataPath: config.sessionDataPath,
-      headless: true,
-      authTimeoutMs: 0,
-      qrTimeoutMs: 0,
-      logConsole: false,
-      logConsoleErrors: false,
-      blockCrashLogs: true,
-      safeMode: true,
-      deleteSessionDataOnLogout: false,
-      killClientOnLogout: false,
-      ...(config.chromePath ? { executablePath: config.chromePath } : {}),
+    // OpenWA 4 performs synchronous bootstrap work. Keeping it in a worker
+    // prevents Chromium/session failures from blocking health checks or the API.
+    const worker = new Worker(new URL("./openwa-worker.js", import.meta.url), {
+      workerData: {
+        sessionId: config.sessionId,
+        sessionDataPath: config.sessionDataPath,
+        chromePath: config.chromePath,
+      },
     });
-    core.events.on("launch.auth.qr.generated", (payload) => {
-      const rawQr = payload.details?.qr || "";
-      if (!rawQr) return;
-      void QRCode.toDataURL(rawQr, { errorCorrectionLevel: "M", margin: 2, width: 360 })
-        .then((dataUrl) => {
-          latestQr = dataUrl;
+    openwaWorker = worker;
+
+    worker.on("message", (message: Record<string, unknown>) => {
+      if (message.type === "response") {
+        const id = Number(message.id);
+        const pending = workerRequests.get(id);
+        if (!pending) return;
+        workerRequests.delete(id);
+        clearTimeout(pending.timer);
+        if (message.ok === true) pending.resolve(message.result);
+        else pending.reject(new Error(String(message.error || "Falha no processo do WhatsApp.")));
+        return;
+      }
+      if (message.type === "qr" && typeof message.value === "string") {
+        const value = message.value;
+        if (value.startsWith("data:image/")) {
+          latestQr = value;
           sessionState = "qr";
-        })
-        .catch((error) => {
-          lastError = "Falha ao renderizar o QR Code.";
-          logger.warn({ err: error }, "QR Code do OpenWA nao foi renderizado");
-        });
-    });
-    core.events.on("session.state.changed", (payload) => {
-      if (payload.details?.next === "DISCONNECTED" || payload.details?.next === "STOPPED") {
-        sessionState = "disconnected";
+        } else {
+          void QRCode.toDataURL(value, { errorCorrectionLevel: "M", margin: 2, width: 360 })
+            .then((dataUrl) => {
+              latestQr = dataUrl;
+              sessionState = "qr";
+            })
+            .catch((error) => logger.warn({ err: error }, "QR Code do OpenWA nao foi renderizado"));
+        }
+        return;
+      }
+      if (message.type === "state") {
+        const state = String(message.state || "error");
+        if (state === "connected") {
+          sessionState = "connected";
+          latestQr = null;
+          lastError = null;
+          connectedAt = new Date().toISOString();
+          void dispatcher.enqueue("session-ready", { connectedAt });
+        } else if (state === "disconnected") {
+          sessionState = "disconnected";
+          latestQr = null;
+        } else if (state === "error") {
+          sessionState = "error";
+          latestQr = null;
+          lastError = String(message.error || "Falha ao iniciar OpenWA.").slice(0, 500);
+          logger.error({ workerError: lastError }, "OpenWA nao iniciou");
+        }
+        return;
+      }
+      if (message.type === "event" && typeof message.eventName === "string") {
+        void dispatcher.enqueue(message.eventName, message.payload);
       }
     });
-    const created = new OpenWAClientFacade({ client: core, transport: core.getTransport() });
-    openwa = core;
-    await created.start();
-    await created.loaded();
-    client = created;
-    latestQr = null;
-    sessionState = "connected";
-    connectedAt = new Date().toISOString();
-    await registerEvents(created);
-    await dispatcher.enqueue("session-ready", { connectedAt });
+
+    worker.on("error", (error) => {
+      if (openwaWorker !== worker) return;
+      sessionState = "error";
+      latestQr = null;
+      lastError = error.message.slice(0, 500);
+      rejectWorkerRequests("Processo do WhatsApp falhou.");
+      logger.error({ err: error }, "Worker OpenWA falhou");
+    });
+    worker.on("exit", (code) => {
+      if (openwaWorker !== worker) return;
+      openwaWorker = null;
+      rejectWorkerRequests("Processo do WhatsApp foi encerrado.");
+      if (code !== 0) {
+        sessionState = "error";
+        latestQr = null;
+        lastError = `Processo OpenWA encerrado com codigo ${code}.`;
+      }
+    });
   } catch (error) {
     sessionState = "error";
     lastError = error instanceof Error ? error.message.slice(0, 500) : "Falha ao iniciar OpenWA.";
@@ -377,7 +409,7 @@ const server = app.listen(config.port, "0.0.0.0", () => {
 async function shutdown(signal: string): Promise<void> {
   logger.info({ signal }, "Encerrando API WhatsApp");
   server.close();
-  if (openwa) await openwa.stop(signal).catch(() => undefined);
+  await stopOpenWAWorker();
   if (persistenceTimer) clearInterval(persistenceTimer);
   await persistence.save().catch(() => undefined);
   process.exit(0);
