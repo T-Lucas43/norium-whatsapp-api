@@ -253,10 +253,10 @@ app.post("/v1/messages/media", requireRole("norium"), sendLimiter, async (reques
   response.json({ sent: Boolean(result), messageId: result });
 });
 
-app.get("/v1/chats", requireRole("norium"), async (_request, response) => response.json(await invokeOpenWA("getAllChats")));
-app.get("/v1/contacts", requireRole("norium"), async (_request, response) => response.json(await invokeOpenWA("getAllContacts")));
+app.get("/v1/chats", requireRole("norium"), async (_request, response) => response.json(await invokeOpenWA("__noriumChatCatalog", [], 20_000)));
+app.get("/v1/contacts", requireRole("norium"), async (_request, response) => response.json(await invokeOpenWA("__noriumContactCatalog", [], 20_000)));
 app.get("/v1/groups", requireRole("norium"), async (_request, response) => {
-  const chats = await invokeOpenWA<any[]>("getAllChats");
+  const chats = await invokeOpenWA<any[]>("__noriumChatCatalog", [], 20_000);
   response.json(chats.filter((chat: any) => Boolean(chat.isGroup || String(chat.id || "").endsWith("@g.us"))));
 });
 app.get("/v1/contacts/:id/profile-picture", requireRole("norium"), async (request, response) => {

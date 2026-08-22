@@ -114,6 +114,76 @@ const CURRENT_WA_COMPATIBILITY_SCRIPT = `(() => {
   return true;
 })()`;
 
+const CHAT_CATALOG_SCRIPT = `(() => {
+  const modelsOf = (collection) => {
+    if (Array.isArray(collection?.models)) return collection.models;
+    if (Array.isArray(collection?._models)) return collection._models;
+    return [];
+  };
+  const serializedId = (value) => String(value?._serialized || value?.id?._serialized || value || '');
+  const timestampOf = (value) => Number(value?.t || value?.timestamp || value?.id?.t || 0) || 0;
+  const labelFor = (type) => ({
+    image: '[Imagem]', video: '[Video]', audio: '[Audio]', ptt: '[Audio]',
+    document: '[Documento]', sticker: '[Figurinha]', location: '[Localizacao]',
+    contact: '[Contato]', vcard: '[Contato]'
+  }[String(type || '').toLowerCase()] || '[Mensagem]');
+  const chats = modelsOf(window.Store?.Chat).map((chat) => {
+    const id = serializedId(chat?.id);
+    const contact = chat?.contact || {};
+    const allMessages = modelsOf(chat?.msgs);
+    const messages = allMessages.slice(-20).map((message) => {
+      const type = String(message?.type || 'chat');
+      const content = String(message?.body || message?.caption || labelFor(type));
+      return {
+        id: serializedId(message?.id) || ('history-' + id + '-' + timestampOf(message)),
+        fromMe: Boolean(message?.id?.fromMe || message?.fromMe),
+        timestamp: timestampOf(message),
+        content: content.slice(0, 65536),
+        type,
+        senderName: String(message?.senderObj?.formattedName || message?.senderObj?.pushname || '')
+      };
+    }).filter((message) => message.timestamp > 0);
+    const latest = messages[messages.length - 1];
+    const photo = contact?.profilePicThumb || {};
+    return {
+      id,
+      phone: id,
+      jid: id,
+      name: String(chat?.formattedTitle || chat?.name || contact?.formattedName || contact?.name || contact?.pushname || id),
+      formattedTitle: String(chat?.formattedTitle || ''),
+      pushname: String(contact?.pushname || ''),
+      isGroup: Boolean(chat?.isGroup || id.endsWith('@g.us')),
+      unreadCount: Number(chat?.unreadCount || 0) || 0,
+      timestamp: latest?.timestamp || timestampOf(chat),
+      lastMessage: latest?.content || '',
+      photoUrl: String(photo?.eurl || photo?.imgFull || photo?.img || ''),
+      messages
+    };
+  }).filter((chat) => chat.id && !chat.id.endsWith('@broadcast'));
+  chats.sort((left, right) => right.timestamp - left.timestamp);
+  return chats.slice(0, 250);
+})()`;
+
+const CONTACT_CATALOG_SCRIPT = `(() => {
+  const models = Array.isArray(window.Store?.Contact?.models)
+    ? window.Store.Contact.models
+    : (Array.isArray(window.Store?.Contact?._models) ? window.Store.Contact._models : []);
+  return models.slice(0, 2000).map((contact) => {
+    const id = String(contact?.id?._serialized || contact?.id || '');
+    const photo = contact?.profilePicThumb || {};
+    return {
+      id,
+      phone: id,
+      jid: id,
+      name: String(contact?.formattedName || contact?.name || contact?.pushname || id),
+      formattedName: String(contact?.formattedName || ''),
+      verifiedName: String(contact?.verifiedName || ''),
+      pushname: String(contact?.pushname || ''),
+      photoUrl: String(photo?.eurl || photo?.imgFull || photo?.img || '')
+    };
+  }).filter((contact) => contact.id);
+})()`;
+
 if (!channel) throw new Error("Canal IPC do OpenWA indisponivel.");
 
 function serializable(value: unknown): unknown {
@@ -201,6 +271,18 @@ channel.on("message", (message: InvokeMessage) => {
       if (!client || !verifiedConnected) throw new Error("WhatsApp ainda nao esta conectado.");
       if (message.method === "__methods") {
         post({ type: "response", id: message.id, ok: true, result: availableMethods(client) });
+        return;
+      }
+      if (message.method === "__noriumChatCatalog") {
+        if (!core) throw new Error("Runtime do WhatsApp indisponivel.");
+        const result = await core.evaluateScript<unknown[]>(CHAT_CATALOG_SCRIPT);
+        post({ type: "response", id: message.id, ok: true, result });
+        return;
+      }
+      if (message.method === "__noriumContactCatalog") {
+        if (!core) throw new Error("Runtime do WhatsApp indisponivel.");
+        const result = await core.evaluateScript<unknown[]>(CONTACT_CATALOG_SCRIPT);
+        post({ type: "response", id: message.id, ok: true, result });
         return;
       }
       if (!/^[a-zA-Z][a-zA-Z0-9]{1,80}$/.test(message.method) || message.method.startsWith("on")) {
