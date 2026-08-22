@@ -180,7 +180,27 @@ app.get("/", (_request, response) => {
 });
 
 app.get("/health", (_request, response) => {
-  response.json({ status: "ok", service: "norium-whatsapp-api", session: sessionState, uptime: Math.round(process.uptime()) });
+  const error = (lastError || "").toLowerCase();
+  const sessionIssue = sessionState !== "error"
+    ? null
+    : error.includes("sandbox") || error.includes("zygote")
+      ? "chromium_sandbox"
+      : error.includes("browser") || error.includes("executable")
+        ? "chromium_launch"
+        : error.includes("err_") || error.includes("network") || error.includes("navigation")
+          ? "whatsapp_network"
+          : error.includes("tos") || error.includes("blocked")
+            ? "whatsapp_restricted"
+            : error.includes("session") || error.includes("auth")
+              ? "session_bootstrap"
+              : "openwa_start_failed";
+  response.json({
+    status: "ok",
+    service: "norium-whatsapp-api",
+    session: sessionState,
+    ...(sessionIssue ? { sessionIssue } : {}),
+    uptime: Math.round(process.uptime()),
+  });
 });
 
 app.get("/ready", (_request, response) => {

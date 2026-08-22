@@ -3,7 +3,7 @@ import { dirname, relative, resolve, sep } from "node:path";
 import { config } from "./config.js";
 
 type SnapshotFile = { path: string; data: string };
-type Snapshot = { version: 1; createdAt: string; files: SnapshotFile[] };
+type Snapshot = { version: 1 | 2; sessionFormat?: string; createdAt: string; files: SnapshotFile[] };
 
 const ignoredNames = new Set([
   "SingletonCookie", "SingletonLock", "SingletonSocket", "DevToolsActivePort", "LOCK",
@@ -39,8 +39,12 @@ export class BlobPersistence {
     if (response.status === 404) return false;
     if (!response.ok) throw new Error(`Falha ao restaurar persistencia (${response.status}).`);
     const snapshot = await response.json() as Snapshot;
-    if (snapshot.version !== 1 || !Array.isArray(snapshot.files)) throw new Error("Snapshot de persistencia invalido.");
+    if (![1, 2].includes(snapshot.version) || !Array.isArray(snapshot.files)) throw new Error("Snapshot de persistencia invalido.");
+    const sessionRoot = relative(config.persistenceRoot, config.sessionDataPath).replaceAll("\\", "/").replace(/\/$/, "");
+    const sessionCompatible = snapshot.sessionFormat === config.sessionFormatVersion;
     for (const file of snapshot.files) {
+      const normalizedPath = String(file.path || "").replaceAll("\\", "/");
+      if (!sessionCompatible && (normalizedPath === sessionRoot || normalizedPath.startsWith(`${sessionRoot}/`))) continue;
       const destination = safeDestination(String(file.path || ""));
       if (!destination) continue;
       await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
@@ -59,7 +63,12 @@ export class BlobPersistence {
   private async saveNow(): Promise<void> {
     const files: SnapshotFile[] = [];
     await collect(config.persistenceRoot, files);
-    const payload: Snapshot = { version: 1, createdAt: new Date().toISOString(), files };
+    const payload: Snapshot = {
+      version: 2,
+      sessionFormat: config.sessionFormatVersion,
+      createdAt: new Date().toISOString(),
+      files,
+    };
     const body = JSON.stringify(payload);
     if (Buffer.byteLength(body) > 64 * 1024 * 1024) throw new Error("Snapshot de persistencia excedeu o limite seguro.");
     const response = await fetch(config.persistenceBlobUrl, {
