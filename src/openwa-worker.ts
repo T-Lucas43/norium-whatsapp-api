@@ -1,7 +1,6 @@
 import { createRequire } from "node:module";
 import { parentPort, workerData } from "node:worker_threads";
-import type { Client } from "@open-wa/client";
-import type { OpenWAClient } from "@open-wa/core";
+import type { Chat, Client, Contact, Message, ReactionEvent } from "@open-wa/wa-automate";
 
 type WorkerConfiguration = {
   sessionId: string;
@@ -9,283 +8,15 @@ type WorkerConfiguration = {
   chromePath?: string;
 };
 
-type InvokeMessage = {
-  type: "invoke";
-  id: number;
-  method: string;
-  args: unknown[];
-};
-
-type ShutdownMessage = {
-  type: "shutdown";
-};
-
-type OpenWAEvent<T = Record<string, unknown>> = {
-  details?: T;
-  error?: { message?: string };
-};
+type InvokeMessage = { type: "invoke"; id: number; method: string; args: unknown[] };
+type ShutdownMessage = { type: "shutdown" };
+type AnyRecord = Record<string, any>;
 
 const configuration = workerData as WorkerConfiguration;
 const channel = parentPort;
 const runtimeRequire = createRequire(import.meta.url);
 let client: Client | null = null;
-let core: OpenWAClient | null = null;
-let verifiedConnected = false;
-let qrPoller: NodeJS.Timeout | null = null;
-let disconnectTimer: NodeJS.Timeout | null = null;
-let bootstrapRetryTimer: NodeJS.Timeout | null = null;
-let lastPolledQr: string | null = null;
-
-const QR_SNAPSHOT_SCRIPT = `(() => {
-  const webEntry = Array.from(document.querySelectorAll('a, button, [role="button"]'))
-    .find((element) => String(element.textContent || '').toLowerCase().includes('whatsapp web'));
-  if (webEntry && !webEntry.hasAttribute('data-norium-opened')) {
-    webEntry.setAttribute('data-norium-opened', 'true');
-    webEntry.click();
-    return null;
-  }
-  const directRef = Array.from(document.querySelectorAll('[data-ref]'))
-    .map((element) => element.getAttribute('data-ref'))
-    .find((value) => typeof value === 'string' && value.length > 20);
-  if (directRef) return directRef;
-  const canvases = Array.from(document.querySelectorAll('canvas'));
-  const qrCanvas = canvases.find((canvas) => {
-    const label = String(canvas.getAttribute('aria-label') || '').toLowerCase();
-    return label.includes('qr') || label.includes('scan');
-  }) || canvases.find((canvas) => canvas.width >= 180 && canvas.height >= 180 && Math.abs(canvas.width - canvas.height) <= 24);
-  if (!qrCanvas) return null;
-  const dataRef = qrCanvas.closest('[data-ref]')?.getAttribute('data-ref')
-    || qrCanvas.parentElement?.getAttribute('data-ref');
-  if (dataRef) return dataRef;
-  try { return qrCanvas.toDataURL('image/png'); } catch { return null; }
-})()`;
-
-const CURRENT_WA_COMPATIBILITY_SCRIPT = `(() => {
-  if (!window.WAPI) return false;
-
-  const getSocket = () => window.Store?.State?.Socket
-    || window.Store?.State?.default
-    || (() => { try { return window.require?.('WAWebSocketModel')?.Socket; } catch { return null; } })();
-  const readState = () => {
-    const socket = getSocket();
-    const socketState = socket?.state || socket?.stream;
-    if (typeof socketState === 'string' && socketState) return socketState;
-    const authenticated = Boolean(
-      window.WA_AUTHENTICATED
-      || document.querySelector('#pane-side')
-      || document.querySelector('[data-testid="chat-list-search"]')
-      || (window.Store?.Chat && !document.querySelector('[data-ref]'))
-    );
-    return authenticated ? 'CONNECTED' : 'UNPAIRED';
-  };
-
-  window.__NORIUM_STATE_CALLBACKS__ = window.__NORIUM_STATE_CALLBACKS__ || new Set();
-  window.WAPI.onStateChanged = function (callback) {
-    window.__NORIUM_STATE_CALLBACKS__.add(callback);
-    const socket = getSocket();
-    if (socket?.on && !socket.__NORIUM_STATE_BRIDGE__) {
-      const emit = (payload) => {
-        const next = payload?.state || payload?.stream || readState();
-        window.__NORIUM_STATE_CALLBACKS__.forEach((listener) => {
-          try { listener(next); } catch {}
-        });
-      };
-      socket.on('change:state', emit);
-      socket.on('change:stream', emit);
-      socket.__NORIUM_STATE_BRIDGE__ = true;
-    }
-    if (!window.__NORIUM_STATE_TIMER__) {
-      let previous = readState();
-      window.__NORIUM_STATE_TIMER__ = setInterval(() => {
-        const next = readState();
-        if (next === previous) return;
-        previous = next;
-        window.__NORIUM_STATE_CALLBACKS__.forEach((listener) => {
-          try { listener(next); } catch {}
-        });
-      }, 1000);
-    }
-    return true;
-  };
-  window.WAPI.getState = readState;
-  window.WAPI.getConnectionState = readState;
-  window.WAPI.getHostNumber = function () {
-    const value = window.Store?.Me?.me?.user
-      || window.Store?.Me?.wid?.user
-      || window.Store?.Me?.attributes?.wid?.user
-      || localStorage.getItem('last-wid-md')
-      || '';
-    return String(value).replace(/["']/g, '').split('@')[0].split(':')[0];
-  };
-  return true;
-})()`;
-
-const CHAT_CATALOG_SCRIPT = `(() => {
-  const modelsOf = (collection) => {
-    if (Array.isArray(collection?.models)) return collection.models;
-    if (Array.isArray(collection?._models)) return collection._models;
-    return [];
-  };
-  const serializedId = (value) => String(value?._serialized || value?.id?._serialized || value || '');
-  const timestampOf = (value) => Number(value?.t || value?.timestamp || value?.id?.t || 0) || 0;
-  const labelFor = (type) => ({
-    image: '[Imagem]', video: '[Video]', audio: '[Audio]', ptt: '[Audio]',
-    document: '[Documento]', sticker: '[Figurinha]', location: '[Localizacao]',
-    contact: '[Contato]', vcard: '[Contato]'
-  }[String(type || '').toLowerCase()] || '[Mensagem]');
-  const chats = modelsOf(window.Store?.Chat).map((chat) => {
-    const id = serializedId(chat?.id);
-    const contact = chat?.contact || {};
-    const allMessages = modelsOf(chat?.msgs);
-    const messages = allMessages.slice(-20).map((message) => {
-      const type = String(message?.type || 'chat');
-      const content = String(message?.body || message?.caption || labelFor(type));
-      return {
-        id: serializedId(message?.id) || ('history-' + id + '-' + timestampOf(message)),
-        fromMe: Boolean(message?.id?.fromMe || message?.fromMe),
-        timestamp: timestampOf(message),
-        content: content.slice(0, 65536),
-        type,
-        senderName: String(message?.senderObj?.formattedName || message?.senderObj?.pushname || '')
-      };
-    }).filter((message) => message.timestamp > 0);
-    const latest = messages[messages.length - 1];
-    const photo = contact?.profilePicThumb || {};
-    return {
-      id,
-      phone: id,
-      jid: id,
-      name: String(chat?.formattedTitle || chat?.name || contact?.formattedName || contact?.name || contact?.pushname || id),
-      formattedTitle: String(chat?.formattedTitle || ''),
-      pushname: String(contact?.pushname || ''),
-      isGroup: Boolean(chat?.isGroup || id.endsWith('@g.us')),
-      unreadCount: Number(chat?.unreadCount || 0) || 0,
-      timestamp: latest?.timestamp || timestampOf(chat),
-      lastMessage: latest?.content || '',
-      photoUrl: String(photo?.eurl || photo?.imgFull || photo?.img || ''),
-      messages
-    };
-  }).filter((chat) => chat.id && !chat.id.endsWith('@broadcast'));
-  chats.sort((left, right) => right.timestamp - left.timestamp);
-  return chats.slice(0, 250);
-})()`;
-
-const CONTACT_CATALOG_SCRIPT = `(() => {
-  const models = Array.isArray(window.Store?.Contact?.models)
-    ? window.Store.Contact.models
-    : (Array.isArray(window.Store?.Contact?._models) ? window.Store.Contact._models : []);
-  return models.slice(0, 2000).map((contact) => {
-    const id = String(contact?.id?._serialized || contact?.id || '');
-    const photo = contact?.profilePicThumb || {};
-    return {
-      id,
-      phone: id,
-      jid: id,
-      name: String(contact?.formattedName || contact?.name || contact?.pushname || id),
-      formattedName: String(contact?.formattedName || ''),
-      verifiedName: String(contact?.verifiedName || ''),
-      pushname: String(contact?.pushname || ''),
-      photoUrl: String(photo?.eurl || photo?.imgFull || photo?.img || ''),
-      bio: String(contact?.status?.status || contact?.status?.text || contact?.status || contact?.about || ''),
-      isBusiness: Boolean(contact?.isBusiness || contact?.isEnterprise),
-      isMyContact: Boolean(contact?.isMyContact),
-      isBlocked: Boolean(contact?.isBlocked)
-    };
-  }).filter((contact) => contact.id);
-})()`;
-
-function contactDetailsScript(contactId: string): string {
-  return `(() => {
-    const contactId = ${JSON.stringify(contactId)};
-    const contact = window.Store?.Contact?.get?.(contactId)
-      || (window.Store?.Contact?.models || window.Store?.Contact?._models || [])
-        .find((item) => String(item?.id?._serialized || item?.id || '') === contactId);
-    if (!contact) return null;
-    const id = String(contact?.id?._serialized || contact?.id || contactId);
-    const photo = contact?.profilePicThumb || {};
-    return {
-      id,
-      phone: id,
-      name: String(contact?.formattedName || contact?.name || contact?.pushname || id),
-      formattedName: String(contact?.formattedName || ''),
-      pushname: String(contact?.pushname || ''),
-      verifiedName: String(contact?.verifiedName || ''),
-      photoUrl: String(photo?.eurl || photo?.imgFull || photo?.img || ''),
-      bio: String(contact?.status?.status || contact?.status?.text || contact?.status || contact?.about || ''),
-      isBusiness: Boolean(contact?.isBusiness || contact?.isEnterprise),
-      isMyContact: Boolean(contact?.isMyContact),
-      isBlocked: Boolean(contact?.isBlocked)
-    };
-  })()`;
-}
-
-function groupDetailsScript(groupId: string): string {
-  return `(() => {
-    const groupId = ${JSON.stringify(groupId)};
-    const serializedId = (value) => String(value?._serialized || value?.id?._serialized || value || '');
-    const modelsOf = (collection) => Array.isArray(collection?.models)
-      ? collection.models
-      : (Array.isArray(collection?._models) ? collection._models : []);
-    const chat = window.Store?.Chat?.get?.(groupId)
-      || modelsOf(window.Store?.Chat).find((item) => serializedId(item?.id) === groupId);
-    if (!chat) return null;
-    const metadata = chat?.groupMetadata || {};
-    const photo = chat?.contact?.profilePicThumb || {};
-    const participants = modelsOf(metadata?.participants).map((participant) => {
-      const id = serializedId(participant?.id || participant?.contact?.id);
-      const contact = participant?.contact || window.Store?.Contact?.get?.(id) || {};
-      return {
-        id,
-        phone: id,
-        name: String(contact?.formattedName || contact?.name || contact?.pushname || id),
-        isAdmin: Boolean(participant?.isAdmin),
-        isSuperAdmin: Boolean(participant?.isSuperAdmin)
-      };
-    }).filter((participant) => participant.id);
-    return {
-      id: groupId,
-      subject: String(metadata?.subject || chat?.formattedTitle || chat?.name || groupId),
-      name: String(metadata?.subject || chat?.formattedTitle || chat?.name || groupId),
-      description: String(metadata?.desc || metadata?.description || ''),
-      owner: serializedId(metadata?.owner),
-      createdAt: Number(metadata?.creation || metadata?.createdAt || 0) || null,
-      participants,
-      participantCount: participants.length,
-      photoUrl: String(photo?.eurl || photo?.imgFull || photo?.img || '')
-    };
-  })()`;
-}
-
-function messageCatalogScript(chatId: string, before: number | null, limit: number): string {
-  return `(() => {
-    const chatId = ${JSON.stringify(chatId)};
-    const before = ${before === null ? "null" : String(before)};
-    const limit = ${limit};
-    const chat = window.Store?.Chat?.get?.(chatId)
-      || (window.Store?.Chat?.models || window.Store?.Chat?._models || []).find((item) => String(item?.id?._serialized || item?.id || '') === chatId);
-    const models = Array.isArray(chat?.msgs?.models) ? chat.msgs.models : (Array.isArray(chat?.msgs?._models) ? chat.msgs._models : []);
-    const timestampOf = (value) => Number(value?.t || value?.timestamp || value?.id?.t || 0) || 0;
-    const serializedId = (value) => String(value?._serialized || value?.id?._serialized || value || '');
-    const labelFor = (type) => ({ image: '[Imagem]', video: '[Video]', audio: '[Audio]', ptt: '[Audio]', document: '[Documento]', sticker: '[Figurinha]', location: '[Localizacao]', contact: '[Contato]', vcard: '[Contato]' }[String(type || '').toLowerCase()] || '[Mensagem]');
-    const eligible = models.filter((message) => !before || timestampOf(message) < before);
-    const selected = eligible.slice(-limit);
-    const items = selected.map((message) => {
-      const type = String(message?.type || 'chat');
-      return {
-        id: serializedId(message?.id) || ('history-' + chatId + '-' + timestampOf(message)),
-        fromMe: Boolean(message?.id?.fromMe || message?.fromMe),
-        timestamp: timestampOf(message),
-        content: String(message?.body || message?.caption || labelFor(type)).slice(0, 65536),
-        type,
-        senderName: String(message?.senderObj?.formattedName || message?.senderObj?.pushname || ''),
-        mimetype: String(message?.mimetype || message?.mediaData?.mimetype || ''),
-        filename: String(message?.filename || ''),
-        duration: Number(message?.duration || message?.mediaData?.duration || 0) || 0
-      };
-    }).filter((message) => message.timestamp > 0);
-    return { items, cursor: items.length ? items[0].timestamp : null, hasMore: eligible.length > selected.length };
-  })()`;
-}
+let connected = false;
 
 if (!channel) throw new Error("Canal IPC do OpenWA indisponivel.");
 
@@ -298,68 +29,249 @@ function post(message: Record<string, unknown>): void {
   channel!.postMessage(serializable(message));
 }
 
-function stopQrPoller(): void {
-  if (qrPoller) clearInterval(qrPoller);
-  qrPoller = null;
+function serializedId(value: unknown): string {
+  if (typeof value === "string" || typeof value === "number") return String(value);
+  if (!value || typeof value !== "object") return "";
+  const record = value as AnyRecord;
+  return String(record._serialized || record.id?._serialized || record.id || record.remote || "");
 }
 
-function clearDisconnectTimer(): void {
-  if (disconnectTimer) clearTimeout(disconnectTimer);
-  disconnectTimer = null;
+function timestampOf(value: AnyRecord | null | undefined): number {
+  return Number(value?.t || value?.timestamp || value?.id?.t || 0) || 0;
 }
 
-function scheduleDisconnected(): void {
-  clearDisconnectTimer();
-  disconnectTimer = setTimeout(() => {
-    disconnectTimer = null;
-    if (!verifiedConnected) post({ type: "state", state: "disconnected" });
-  }, 12_000);
-  disconnectTimer.unref();
+function labelFor(type: string): string {
+  return ({
+    image: "[Imagem]", video: "[Video]", audio: "[Audio]", ptt: "[Audio]",
+    document: "[Documento]", sticker: "[Figurinha]", location: "[Localizacao]",
+    contact: "[Contato]", vcard: "[Contato]", poll_creation: "[Enquete]",
+  } as Record<string, string>)[type.toLowerCase()] || "";
 }
 
-async function confirmReconnected(): Promise<void> {
-  if (verifiedConnected || !client) return;
+function ackStatus(ack: unknown): "erro" | "pendente" | "enviado" | "entregue" | "lido" | "reproduzido" {
+  const value = Number(ack);
+  if (value < 0) return "erro";
+  if (value === 0) return "pendente";
+  if (value === 1) return "enviado";
+  if (value === 2) return "entregue";
+  if (value === 3) return "lido";
+  if (value >= 4) return "reproduzido";
+  return "enviado";
+}
+
+function normalizeReactions(message: AnyRecord): AnyRecord[] {
+  const groups = Array.isArray(message.reactions) ? message.reactions : [];
+  return groups.flatMap((group: AnyRecord) => {
+    const emoji = String(group.aggregateEmoji || group.emoji || "");
+    const senders = Array.isArray(group.senders) ? group.senders : [];
+    if (!senders.length && emoji) {
+      return [{ emoji, count: Number(group.count || 1), fromMe: Boolean(group.hasReactionByMe), senders: [] }];
+    }
+    return emoji ? [{
+      emoji,
+      count: senders.length,
+      fromMe: Boolean(group.hasReactionByMe),
+      senders: senders.map((sender: AnyRecord) => String(sender.senderUserJid || sender.senderId || "")).filter(Boolean),
+    }] : [];
+  });
+}
+
+function chatIdFor(message: AnyRecord): string {
+  const explicit = serializedId(message.chatId);
+  if (explicit) return explicit;
+  const from = serializedId(message.from);
+  const to = serializedId(message.to);
+  if (message.isGroupMsg || from.endsWith("@g.us") || to.endsWith("@g.us")) {
+    return from.endsWith("@g.us") ? from : to;
+  }
+  return message.fromMe ? to : from;
+}
+
+function normalizeMessage(value: Message | AnyRecord): AnyRecord {
+  const message = value as AnyRecord;
+  const type = String(message.type || "chat").toLowerCase();
+  const id = serializedId(message.id) || serializedId(message.mId) || `history-${chatIdFor(message)}-${timestampOf(message)}`;
+  const sender = (message.sender || message.senderObj || {}) as AnyRecord;
+  const quoted = (message.quotedMsg || message.quotedMsgObj || null) as AnyRecord | null;
+  const rawText = String(message.text || message.caption || message.content || (type === "chat" ? message.body || "" : ""));
+  const content = rawText || labelFor(type);
+  const senderId = serializedId(message.author || message.senderId || sender.id || message.from);
+  return {
+    id,
+    chatId: chatIdFor(message),
+    isGroup: chatIdFor(message).endsWith("@g.us"),
+    chatName: String(message.chat?.formattedTitle || message.chat?.name || ""),
+    fromMe: Boolean(message.fromMe || message.self === "out"),
+    timestamp: timestampOf(message),
+    content: content.slice(0, 65_536),
+    text: rawText.slice(0, 65_536),
+    caption: String(message.caption || "").slice(0, 4096),
+    type,
+    senderId,
+    senderName: String(sender.formattedName || sender.pushname || sender.name || message.notifyName || ""),
+    mimetype: String(message.mimetype || message.mediaData?.mimetype || ""),
+    filename: String(message.filename || ""),
+    duration: Number(message.duration || message.mediaData?.duration || 0) || 0,
+    ack: Number.isFinite(Number(message.ack)) ? Number(message.ack) : null,
+    status: ackStatus(message.ack),
+    isMedia: Boolean(message.isMedia || ["image", "video", "audio", "ptt", "document", "sticker"].includes(type)),
+    mediaAvailable: Boolean(message.isMedia || message.deprecatedMms3Url || message.clientUrl || message.filehash),
+    reactions: normalizeReactions(message),
+    quoted: quoted ? {
+      id: serializedId(quoted.id),
+      content: String(quoted.text || quoted.caption || quoted.content || quoted.body || labelFor(String(quoted.type || "chat"))).slice(0, 512),
+      senderName: String(quoted.sender?.formattedName || quoted.sender?.pushname || quoted.notifyName || ""),
+      type: String(quoted.type || "chat"),
+    } : null,
+  };
+}
+
+function messagesFromChat(chat: AnyRecord): Message[] {
+  const source = chat?.msgs;
+  if (Array.isArray(source)) return source;
+  if (Array.isArray(source?.models)) return source.models;
+  if (Array.isArray(source?._models)) return source._models;
+  return [];
+}
+
+function photoFrom(value: AnyRecord): string {
+  const picture = value.profilePicThumbObj || value.profilePicThumb || value.contact?.profilePicThumbObj || value.contact?.profilePicThumb || {};
+  return String(value.pic || picture.eurl || picture.imgFull || picture.img || "");
+}
+
+function normalizeContact(value: Contact | AnyRecord): AnyRecord {
+  const contact = value as AnyRecord;
+  const id = serializedId(contact.id);
+  return {
+    id,
+    phone: id,
+    jid: id,
+    name: String(contact.formattedName || contact.name || contact.pushname || contact.shortName || id),
+    formattedName: String(contact.formattedName || ""),
+    verifiedName: String(contact.verifiedName || ""),
+    pushname: String(contact.pushname || ""),
+    photoUrl: photoFrom(contact),
+    bio: String(contact.status?.status || contact.status?.text || contact.status || contact.about || ""),
+    isBusiness: Boolean(contact.isBusiness || contact.isEnterprise),
+    isMyContact: Boolean(contact.isMyContact),
+    isBlocked: Boolean(contact.isBlocked),
+  };
+}
+
+function normalizeChat(value: Chat | AnyRecord): AnyRecord {
+  const chat = value as AnyRecord;
+  const id = serializedId(chat.id);
+  const recent = messagesFromChat(chat)
+    .map(normalizeMessage)
+    .filter((message) => message.timestamp > 0 && !String(message.type).includes("notification"))
+    .sort((left, right) => left.timestamp - right.timestamp)
+    .slice(-25);
+  const latest = recent[recent.length - 1];
+  const contact = (chat.contact || {}) as AnyRecord;
+  return {
+    id,
+    phone: id,
+    jid: id,
+    name: String(chat.formattedTitle || chat.name || contact.formattedName || contact.name || contact.pushname || id),
+    formattedTitle: String(chat.formattedTitle || ""),
+    pushname: String(contact.pushname || ""),
+    isGroup: Boolean(chat.isGroup || id.endsWith("@g.us")),
+    unreadCount: Number(chat.unreadCount || 0) || 0,
+    timestamp: latest?.timestamp || timestampOf(chat),
+    lastMessage: latest?.content || "",
+    lastMessageType: latest?.type || "",
+    photoUrl: photoFrom(chat),
+    messages: recent,
+  };
+}
+
+async function profilePicture(id: string): Promise<string> {
+  if (!client || !id) return "";
   try {
-    const hostNumber = String(await client.getHostNumber()).trim();
-    if (!hostNumber) return;
-    clearDisconnectTimer();
-    verifiedConnected = true;
-    post({ type: "state", state: "connected", hostNumber });
+    return String(await client.getProfilePicFromServer(id as never) || "");
   } catch {
-    scheduleDisconnected();
+    return "";
   }
 }
 
-function startQrPoller(openwa: OpenWAClient): void {
-  stopQrPoller();
-  qrPoller = setInterval(() => {
-    void openwa.evaluateScript<string | null>(QR_SNAPSHOT_SCRIPT)
-      .then((value) => {
-        if (typeof value !== "string" || !value || value === lastPolledQr) return;
-        lastPolledQr = value;
-        post({ type: "qr", value });
-      })
-      .catch(() => undefined);
-  }, 1_500);
-  qrPoller.unref();
+async function chatCatalog(): Promise<AnyRecord[]> {
+  if (!client) return [];
+  const chats = await client.getAllChatsWithMessages(false);
+  return chats
+    .map(normalizeChat)
+    .filter((chat) => chat.id && !chat.id.endsWith("@broadcast"))
+    .sort((left, right) => right.timestamp - left.timestamp)
+    .slice(0, 500);
 }
 
-async function installCurrentWACompatibility(openwa: OpenWAClient): Promise<void> {
-  const installed = await openwa.evaluateScript<boolean>(CURRENT_WA_COMPATIBILITY_SCRIPT);
-  if (!installed) throw new Error("Runtime do WhatsApp nao estava disponivel para compatibilidade.");
+async function contactDetails(contactId: string): Promise<AnyRecord | null> {
+  if (!client) return null;
+  try {
+    const contact = normalizeContact(await client.getContact(contactId as never));
+    const [photoUrl, status] = await Promise.all([
+      contact.photoUrl ? Promise.resolve(contact.photoUrl) : profilePicture(contactId),
+      client.getStatus(contactId as never).catch(() => null),
+    ]);
+    contact.photoUrl = photoUrl;
+    if (status?.status) contact.bio = status.status;
+    return contact;
+  } catch {
+    return null;
+  }
 }
 
-function keepCompatibilityAfterOpenWAReinjection(openwa: OpenWAClient): void {
-  const transport = openwa.getTransport() as unknown as Record<string, unknown>;
-  for (const methodName of ["performRuntimeInjection", "applyLivePatchArtifacts", "applyDeferredInitPatchArtifact"]) {
-    const original = transport[methodName];
-    if (typeof original !== "function") continue;
-    transport[methodName] = async (...args: unknown[]) => {
-      const result = await Reflect.apply(original, transport, args);
-      await installCurrentWACompatibility(openwa);
-      return result;
+async function groupDetails(groupId: string): Promise<AnyRecord | null> {
+  if (!client) return null;
+  try {
+    const [info, members, photoUrl] = await Promise.all([
+      client.getGroupInfo(groupId as never).catch(() => ({})),
+      client.getGroupMembers(groupId as never).catch(() => []),
+      profilePicture(groupId),
+    ]);
+    const metadata = (info || {}) as AnyRecord;
+    const participants = (Array.isArray(members) ? members : []).map((member) => normalizeContact(member));
+    const participantMeta = Array.isArray(metadata.participants) ? metadata.participants : [];
+    for (const participant of participants) {
+      const match = participantMeta.find((item: AnyRecord) => serializedId(item.id || item.contact?.id) === participant.id);
+      participant.isAdmin = Boolean(match?.isAdmin);
+      participant.isSuperAdmin = Boolean(match?.isSuperAdmin);
+    }
+    return {
+      id: groupId,
+      subject: String(metadata.subject || metadata.formattedTitle || metadata.name || groupId),
+      name: String(metadata.subject || metadata.formattedTitle || metadata.name || groupId),
+      description: String(metadata.desc || metadata.description || ""),
+      owner: serializedId(metadata.owner),
+      createdAt: Number(metadata.creation || metadata.createdAt || 0) || null,
+      participants,
+      participantCount: participants.length,
+      photoUrl,
     };
+  } catch {
+    return null;
   }
+}
+
+async function messageHistory(chatId: string, before: number | null, limit: number): Promise<AnyRecord> {
+  if (!client) return { items: [], cursor: null, hasMore: false };
+  let source = await client.getAllMessagesInChat(chatId as never, true, false);
+  if (!before && source.length < limit) {
+    for (let attempt = 0; attempt < 2 && source.length < limit; attempt += 1) {
+      const loaded = await client.loadEarlierMessages(chatId as never).catch(() => []);
+      if (!loaded.length) break;
+      source = await client.getAllMessagesInChat(chatId as never, true, false);
+    }
+  }
+  const normalized = source
+    .map(normalizeMessage)
+    .filter((message) => message.timestamp > 0 && (!before || message.timestamp < before))
+    .sort((left, right) => left.timestamp - right.timestamp);
+  const items = normalized.slice(-limit);
+  return {
+    items,
+    cursor: items.at(0)?.timestamp || null,
+    hasMore: normalized.length > items.length,
+  };
 }
 
 function availableMethods(instance: Client): string[] {
@@ -376,91 +288,74 @@ function availableMethods(instance: Client): string[] {
 }
 
 async function registerEvents(instance: Client): Promise<void> {
+  await instance.onStateChanged((state) => {
+    const next = String(state || "").toUpperCase();
+    if (["CONNECTED", "READY", "TIMEOUT"].includes(next)) return;
+    if (["UNPAIRED", "UNLAUNCHED", "DISCONNECTED", "CONFLICT"].includes(next) && connected) {
+      connected = false;
+      post({ type: "state", state: "disconnected" });
+    }
+  });
+  await instance.onAnyMessage((payload) => post({ type: "event", eventName: "message", payload: normalizeMessage(payload) }));
+  await instance.onAck((payload) => post({ type: "event", eventName: "ack", payload: normalizeMessage(payload) }));
+  await instance.onReaction((payload: ReactionEvent) => post({
+    type: "event",
+    eventName: "reaction",
+    payload: {
+      type: payload.type,
+      message: normalizeMessage(payload.message),
+      reactions: payload.reactions,
+      reactionByMe: payload.reactionByMe,
+    },
+  }));
+
   const dynamic = instance as unknown as Record<string, unknown>;
-  const listeners: Array<[string, string]> = [
-    ["onAnyMessage", "message"], ["onAck", "ack"],
+  const optional: Array<[string, string]> = [
     ["onAddedToGroup", "group-added"], ["onParticipantsChanged", "group-participants"],
-    ["onIncomingCall", "incoming-call"], ["onButton", "button"],
-    ["onPollVote", "poll-vote"], ["onReaction", "reaction"],
+    ["onIncomingCall", "incoming-call"], ["onPollVote", "poll-vote"],
   ];
-  for (const [method, eventName] of listeners) {
+  for (const [method, eventName] of optional) {
     const target = dynamic[method];
     if (typeof target !== "function") continue;
-    try {
-      await Reflect.apply(target, dynamic, [(payload: unknown) => post({ type: "event", eventName, payload })]);
-    } catch {
-      // Alguns eventos ainda nao estao implementados no runtime v5 alpha.
-    }
+    await Reflect.apply(target, dynamic, [(payload: unknown) => post({ type: "event", eventName, payload })]).catch(() => undefined);
   }
 }
 
 channel.on("message", (message: InvokeMessage | ShutdownMessage) => {
   if (message?.type === "shutdown") {
     void (async () => {
-      stopQrPoller();
-      clearDisconnectTimer();
-      if (bootstrapRetryTimer) clearTimeout(bootstrapRetryTimer);
-      bootstrapRetryTimer = null;
-      verifiedConnected = false;
-      try {
-        await core?.stop("Worker do Norium encerrado.");
-      } catch {
-        // O processo pai ainda encerra o worker caso o navegador nao responda.
-      } finally {
-        post({ type: "shutdown-complete" });
-      }
+      connected = false;
+      await client?.kill("Worker do Norium encerrado.").catch(() => false);
+      client = null;
+      post({ type: "shutdown-complete" });
     })();
     return;
   }
   if (message?.type !== "invoke") return;
   void (async () => {
     try {
-      if (!client || !verifiedConnected) throw new Error("WhatsApp ainda nao esta conectado.");
-      if (message.method === "__methods") {
-        post({ type: "response", id: message.id, ok: true, result: availableMethods(client) });
-        return;
-      }
-      if (message.method === "__noriumChatCatalog") {
-        if (!core) throw new Error("Runtime do WhatsApp indisponivel.");
-        const result = await core.evaluateScript<unknown[]>(CHAT_CATALOG_SCRIPT);
-        post({ type: "response", id: message.id, ok: true, result });
-        return;
-      }
-      if (message.method === "__noriumContactCatalog") {
-        if (!core) throw new Error("Runtime do WhatsApp indisponivel.");
-        const result = await core.evaluateScript<unknown[]>(CONTACT_CATALOG_SCRIPT);
-        post({ type: "response", id: message.id, ok: true, result });
-        return;
-      }
-      if (message.method === "__noriumContactDetails") {
-        if (!core) throw new Error("Runtime do WhatsApp indisponivel.");
-        const result = await core.evaluateScript<Record<string, unknown> | null>(contactDetailsScript(String(message.args?.[0] || "")));
-        post({ type: "response", id: message.id, ok: true, result });
-        return;
-      }
-      if (message.method === "__noriumGroupDetails") {
-        if (!core) throw new Error("Runtime do WhatsApp indisponivel.");
-        const result = await core.evaluateScript<Record<string, unknown> | null>(groupDetailsScript(String(message.args?.[0] || "")));
-        post({ type: "response", id: message.id, ok: true, result });
-        return;
-      }
-      if (message.method === "__noriumMessages") {
-        if (!core) throw new Error("Runtime do WhatsApp indisponivel.");
-        const chatId = String(message.args?.[0] || "");
+      if (!client || !connected) throw new Error("WhatsApp ainda nao esta conectado.");
+      let result: unknown;
+      if (message.method === "__methods") result = availableMethods(client);
+      else if (message.method === "__noriumChatCatalog") result = await chatCatalog();
+      else if (message.method === "__noriumContactCatalog") result = (await client.getAllContacts()).map(normalizeContact);
+      else if (message.method === "__noriumContactDetails") result = await contactDetails(String(message.args?.[0] || ""));
+      else if (message.method === "__noriumGroupDetails") result = await groupDetails(String(message.args?.[0] || ""));
+      else if (message.method === "__noriumProfilePicture") result = await profilePicture(String(message.args?.[0] || ""));
+      else if (message.method === "__noriumMessages") {
         const beforeValue = Number(message.args?.[1] || 0);
         const before = Number.isFinite(beforeValue) && beforeValue > 0 ? beforeValue : null;
         const limit = Math.max(1, Math.min(100, Number(message.args?.[2] || 50)));
-        const result = await core.evaluateScript<Record<string, unknown>>(messageCatalogScript(chatId, before, limit));
-        post({ type: "response", id: message.id, ok: true, result });
-        return;
+        result = await messageHistory(String(message.args?.[0] || ""), before, limit);
+      } else {
+        if (!/^[a-zA-Z][a-zA-Z0-9]{1,80}$/.test(message.method) || message.method.startsWith("on")) {
+          throw new Error("Metodo OpenWA nao permitido.");
+        }
+        const instance = client as unknown as Record<string, unknown>;
+        const target = instance[message.method];
+        if (typeof target !== "function") throw new Error("Metodo OpenWA desconhecido.");
+        result = await Reflect.apply(target, instance, Array.isArray(message.args) ? message.args : []);
       }
-      if (!/^[a-zA-Z][a-zA-Z0-9]{1,80}$/.test(message.method) || message.method.startsWith("on")) {
-        throw new Error("Metodo OpenWA nao permitido.");
-      }
-      const instance = client as unknown as Record<string, unknown>;
-      const target = instance[message.method];
-      if (typeof target !== "function") throw new Error("Metodo OpenWA desconhecido.");
-      const result = await Reflect.apply(target, instance, Array.isArray(message.args) ? message.args : []);
       post({ type: "response", id: message.id, ok: true, result });
     } catch (error) {
       post({
@@ -474,102 +369,54 @@ channel.on("message", (message: InvokeMessage | ShutdownMessage) => {
 });
 
 async function launch(): Promise<void> {
-  if (bootstrapRetryTimer) clearTimeout(bootstrapRetryTimer);
-  bootstrapRetryTimer = null;
   post({ type: "state", state: "starting" });
   try {
-    // The alpha ESM build resolves browser assets from a file:// stack path.
-    // Its CJS export uses a filesystem path and works consistently on Windows/Linux.
-    const { Client: OpenWAClientFacade } = runtimeRequire("@open-wa/client") as typeof import("@open-wa/client");
-    const { createClient } = runtimeRequire("@open-wa/core") as typeof import("@open-wa/core");
-    const { PuppeteerDriver } = runtimeRequire("@open-wa/driver-puppeteer") as typeof import("@open-wa/driver-puppeteer");
+    const openwa = runtimeRequire("@open-wa/wa-automate") as typeof import("@open-wa/wa-automate");
+    openwa.ev.on(`qr.${configuration.sessionId}`, (value: unknown) => {
+      if (typeof value === "string" && value) post({ type: "qr", value });
+    });
+    openwa.ev.on(`state-change.${configuration.sessionId}`, (value: unknown) => {
+      const state = String(value || "").toUpperCase();
+      if (["CONNECTED", "READY", "TIMEOUT"].includes(state) && client) connected = true;
+      if (["UNPAIRED", "UNLAUNCHED", "DISCONNECTED"].includes(state) && connected) {
+        connected = false;
+        post({ type: "state", state: "disconnected" });
+      }
+    });
 
-    const createdCore = await createClient({
+    const created = await openwa.create({
       sessionId: configuration.sessionId,
       sessionDataPath: configuration.sessionDataPath,
-      driver: new PuppeteerDriver(),
       headless: true,
-      qrTimeoutMs: 0,
-      authTimeoutMs: 0,
+      qrTimeout: 0,
+      authTimeout: 0,
+      waitForRipeSessionTimeout: 0,
+      qrLogSkip: true,
+      disableSpins: true,
       blockCrashLogs: true,
       logConsole: false,
       logConsoleErrors: false,
+      killProcessOnBrowserClose: false,
+      skipUpdateCheck: true,
+      chromiumArgs: [
+        "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
+        "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+      ],
       ...(configuration.chromePath ? { executablePath: configuration.chromePath } : {}),
     });
-    core = createdCore;
-    keepCompatibilityAfterOpenWAReinjection(createdCore);
-
-    createdCore.events.on("launch.auth.qr.generated", (event: OpenWAEvent<{ qr?: string }>) => {
-      const value = event.details?.qr;
-      if (typeof value === "string" && value) post({ type: "qr", value });
-    });
-    createdCore.events.on("launch.auth.qr.scanned", () => {
-      stopQrPoller();
-      post({ type: "state", state: "starting" });
-    });
-    createdCore.events.on("session.state.changed", (event: OpenWAEvent<{ next?: string }>) => {
-      const next = String(event.details?.next || "").toUpperCase();
-      if (next === "READY" || next === "CONNECTED") {
-        void confirmReconnected();
-        return;
-      }
-      if (verifiedConnected && (next === "DISCONNECTED" || next === "STOPPED")) {
-        verifiedConnected = false;
-        scheduleDisconnected();
-      }
-    });
-    createdCore.events.on("session.connection.disconnected", () => {
-      if (!verifiedConnected) return;
-      verifiedConnected = false;
-      scheduleDisconnected();
-    });
-    createdCore.events.on("session.logout", () => {
-      clearDisconnectTimer();
-      verifiedConnected = false;
-      post({ type: "state", state: "disconnected" });
-    });
-
-    const createdClient = new OpenWAClientFacade({
-      client: createdCore,
-      transport: createdCore.getTransport(),
-    });
-    startQrPoller(createdCore);
-    await createdClient.start();
-    await createdClient.loaded();
-
-    const authenticatedState = String(createdClient.getState() || "").toUpperCase();
-    if (!["READY", "CONNECTED"].includes(authenticatedState)) {
-      throw new Error(`OpenWA finalizou sem prontidao confirmada (${authenticatedState || "desconhecido"}).`);
-    }
-    const hostNumber = String(await createdClient.getHostNumber()).trim();
+    client = created;
+    const hostNumber = String(await created.getHostNumber()).trim();
     if (!hostNumber) throw new Error("OpenWA nao confirmou o numero autenticado.");
-
-    client = createdClient;
-    await registerEvents(createdClient);
-    verifiedConnected = true;
-    clearDisconnectTimer();
-    stopQrPoller();
-    clearDisconnectTimer();
+    await registerEvents(created);
+    connected = true;
     post({ type: "state", state: "connected", hostNumber });
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : "Falha ao iniciar OpenWA.";
-    stopQrPoller();
-    verifiedConnected = false;
+    connected = false;
     client = null;
-    await core?.stop("bootstrap_failed").catch(() => undefined);
-    core = null;
-    if (errorMessage.includes("QR scan took too long")) {
-      post({ type: "state", state: "starting" });
-      bootstrapRetryTimer = setTimeout(() => {
-        bootstrapRetryTimer = null;
-        void launch();
-      }, 1_500);
-      return;
-    }
     post({
       type: "state",
       state: "error",
-      error: errorMessage.slice(0, 500),
+      error: error instanceof Error ? error.message.slice(0, 500) : "Falha ao iniciar OpenWA.",
     });
   }
 }

@@ -75,6 +75,10 @@ const mediaPayload = z.object({
   filename: z.string().min(1).max(240),
   caption: z.string().max(4096).default(""),
   viewOnce: z.boolean().default(false),
+  asSticker: z.boolean().default(false),
+});
+const reactionPayload = z.object({
+  emoji: z.string().trim().min(0).max(16),
 });
 const rawPayload = z.object({ args: z.array(z.unknown()).max(32).default([]) });
 const historyQuery = z.object({
@@ -114,6 +118,34 @@ function messageIdOf(value: unknown): string | null {
     }
   }
   return null;
+}
+
+function assertSafeImageDataUrl(data: string): void {
+  const match = /^data:(image\/[a-z0-9.+-]+);base64,([a-z0-9+/=\s]+)$/i.exec(data);
+  if (!match) {
+    if (!data.toLowerCase().startsWith("data:image/")) return;
+    const error = new Error("Data URL de imagem invalido.") as Error & { status?: number };
+    error.status = 415;
+    throw error;
+  }
+  const mime = match[1]?.toLowerCase() || "";
+  if (!["image/png", "image/jpeg", "image/gif", "image/webp"].includes(mime)) {
+    const error = new Error("Formato de imagem nao permitido. Use PNG, JPEG, GIF ou WebP.") as Error & { status?: number };
+    error.status = 415;
+    throw error;
+  }
+  const bytes = Buffer.from(match[2] || "", "base64").subarray(0, 16);
+  const hex = bytes.toString("hex");
+  const ascii = bytes.toString("ascii");
+  const valid = mime === "image/png" ? hex.startsWith("89504e470d0a1a0a")
+    : mime === "image/jpeg" ? hex.startsWith("ffd8ff")
+      : mime === "image/gif" ? ascii.startsWith("GIF87a") || ascii.startsWith("GIF89a")
+        : ascii.slice(0, 4) === "RIFF" && ascii.slice(8, 12) === "WEBP";
+  if (!valid) {
+    const error = new Error("Conteudo da imagem nao corresponde ao formato declarado.") as Error & { status?: number };
+    error.status = 415;
+    throw error;
+  }
 }
 
 function idempotencyKey(request: Request): string | null {
@@ -211,11 +243,23 @@ app.post("/v1/messages/media", requireRole("norium"), requireSessionContext, sen
     response.status(422).json({ error: "invalid_media", message: "Use Data URL ou caminho relativo; URLs remotas exigem a API administrativa." });
     return;
   }
+  assertSafeImageDataUrl(body.data);
   const context = requestSessionContext(request);
-  const result = await idempotent(request, () => sessions.invoke(context, "sendFile", [
-    normalizeChatId(body.to), body.data, body.filename, body.caption,
-  ], 90_000));
+  const result = await idempotent(request, () => body.asSticker
+    ? sessions.invoke(context, "sendImageAsSticker", [normalizeChatId(body.to), body.data], 90_000)
+    : sessions.invoke(context, "sendFile", [normalizeChatId(body.to), body.data, body.filename, body.caption], 90_000));
   response.json({ sent: Boolean(result), messageId: messageIdOf(result) });
+});
+
+app.post("/v1/messages/:id/reactions", requireRole("norium"), requireSessionContext, sendLimiter, async (request, response) => {
+  const body = reactionPayload.parse(request.body);
+  const result = await idempotent(request, () => sessions.invoke(
+    requestSessionContext(request),
+    "react",
+    [String(request.params.id || ""), body.emoji],
+    30_000,
+  ));
+  response.json({ reacted: Boolean(result), emoji: body.emoji });
 });
 
 app.get("/v1/messages/:id/media", requireRole("norium"), requireSessionContext, async (request, response) => {
@@ -265,7 +309,7 @@ app.get("/v1/groups", requireRole("norium"), requireSessionContext, async (reque
 });
 app.get("/v1/contacts/:id/profile-picture", requireRole("norium"), requireSessionContext, async (request, response) => {
   const contactId = normalizeChatId(String(request.params.id || ""));
-  const value = await sessions.invoke(requestSessionContext(request), "getProfilePic", [contactId]);
+  const value = await sessions.invoke(requestSessionContext(request), "__noriumProfilePicture", [contactId]);
   response.json({ value: value || null });
 });
 app.get("/v1/groups/:id", requireRole("norium"), requireSessionContext, async (request, response) => {
