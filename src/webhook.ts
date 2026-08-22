@@ -17,6 +17,13 @@ type SessionContext = { userId: string; sessionId: string };
 
 const sleep = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
+function serializedId(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (!value || typeof value !== "object") return value == null ? "" : String(value);
+  const record = value as Record<string, unknown>;
+  return serializedId(record._serialized || record.id || record.user || "");
+}
+
 function safePayload(event: string, data: unknown): unknown {
   if (!["message", "any-message"].includes(event) || typeof data !== "object" || data === null) return data;
   const message = data as Record<string, unknown>;
@@ -26,16 +33,20 @@ function safePayload(event: string, data: unknown): unknown {
   const chat = typeof message.chat === "object" && message.chat !== null
     ? message.chat as Record<string, unknown>
     : {};
+  const messageId = serializedId(message.id || message.messageId);
+  const chatId = serializedId(message.chatId || chat.id || message.from);
+  const senderId = serializedId(message.senderId || sender.id || message.author);
   return {
-    phone: message.from,
-    chatId: message.chatId || message.from,
-    from: message.from,
+    phone: chatId,
+    chatId,
+    from: chatId,
     fromMe: Boolean(message.fromMe),
     senderName: sender.pushname || sender.formattedName || message.notifyName,
     chatName: chat.name || chat.formattedTitle,
-    isGroup: Boolean(message.isGroupMsg),
-    messageId: message.id,
-    id: message.id,
+    isGroup: Boolean(message.isGroupMsg) || chatId.endsWith("@g.us"),
+    senderId,
+    messageId,
+    id: messageId,
     timestamp: message.timestamp,
     type: message.type,
     body: message.body,

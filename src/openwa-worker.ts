@@ -34,6 +34,11 @@ let verifiedConnected = false;
 let qrPoller: NodeJS.Timeout | null = null;
 let disconnectTimer: NodeJS.Timeout | null = null;
 let bootstrapRetryTimer: NodeJS.Timeout | null = null;
+let connectionVerifier: NodeJS.Timeout | null = null;
+let realtimePoller: NodeJS.Timeout | null = null;
+let realtimePolling = false;
+let realtimeInitialized = false;
+let seenRealtimeMessageIds = new Set<string>();
 let lastPolledQr: string | null = null;
 
 const QR_SNAPSHOT_SCRIPT = `(() => {
@@ -218,6 +223,50 @@ const CHAT_CATALOG_SCRIPT = `(() => {
   }).filter((chat) => chat.id && !chat.id.endsWith('@broadcast'));
   chats.sort((left, right) => right.timestamp - left.timestamp);
   return chats.slice(0, 500);
+})()`;
+
+const RECENT_MESSAGES_SCRIPT = `(() => {
+  const modelsOf = (collection) => Array.isArray(collection?.models)
+    ? collection.models
+    : (Array.isArray(collection?._models) ? collection._models : []);
+  const serializedId = (value) => String(value?._serialized || value?.id?._serialized || value || '');
+  const timestampOf = (value) => Number(value?.t || value?.timestamp || value?.id?.t || 0) || 0;
+  const chats = modelsOf(window.Store?.Chat);
+  const messages = [];
+  for (const chat of chats) {
+    const chatId = serializedId(chat?.id);
+    if (!chatId || chatId.endsWith('@broadcast')) continue;
+    const recent = modelsOf(chat?.msgs).slice(-3);
+    for (const message of recent) {
+      const id = serializedId(message?.id);
+      const type = String(message?.type || 'chat').toLowerCase();
+      const timestamp = timestampOf(message);
+      if (!id || !timestamp || type.includes('notification')) continue;
+      const sender = message?.senderObj || message?.sender || {};
+      messages.push({
+        id,
+        chatId,
+        from: chatId,
+        fromMe: Boolean(message?.id?.fromMe || message?.fromMe || message?.self === 'out'),
+        timestamp,
+        type,
+        body: String(message?.text || message?.body || message?.content || message?.caption || '').slice(0, 65536),
+        caption: String(message?.caption || '').slice(0, 4096),
+        mimetype: String(message?.mimetype || message?.mediaData?.mimetype || ''),
+        filename: String(message?.filename || ''),
+        duration: Number(message?.duration || message?.mediaData?.duration || 0) || 0,
+        isGroupMsg: Boolean(chat?.isGroup || chatId.endsWith('@g.us')),
+        sender: {
+          id: serializedId(message?.author || message?.senderId || sender?.id || message?.from),
+          pushname: String(sender?.pushname || sender?.name || message?.notifyName || ''),
+          formattedName: String(sender?.formattedName || sender?.name || sender?.pushname || '')
+        },
+        chat: { name: String(chat?.formattedTitle || chat?.name || chatId) }
+      });
+    }
+  }
+  messages.sort((left, right) => left.timestamp - right.timestamp);
+  return messages.slice(-750);
 })()`;
 
 const CONTACT_CATALOG_SCRIPT = `(() => {
@@ -475,26 +524,84 @@ function clearDisconnectTimer(): void {
   disconnectTimer = null;
 }
 
+function stopConnectionVerifier(): void {
+  if (connectionVerifier) clearInterval(connectionVerifier);
+  connectionVerifier = null;
+}
+
+function stopRealtimePoller(): void {
+  if (realtimePoller) clearInterval(realtimePoller);
+  realtimePoller = null;
+  realtimePolling = false;
+  realtimeInitialized = false;
+  seenRealtimeMessageIds = new Set<string>();
+}
+
 function scheduleDisconnected(): void {
   clearDisconnectTimer();
   disconnectTimer = setTimeout(() => {
     disconnectTimer = null;
     if (!verifiedConnected) post({ type: "state", state: "disconnected" });
-  }, 12_000);
+  }, 45_000);
   disconnectTimer.unref();
 }
 
 async function confirmReconnected(): Promise<void> {
-  if (verifiedConnected || !client) return;
+  if (!client) return;
   try {
+    const state = String(client.getState() || "").toUpperCase();
+    if (!["READY", "CONNECTED"].includes(state)) {
+      if (verifiedConnected) verifiedConnected = false;
+      scheduleDisconnected();
+      return;
+    }
     const hostNumber = String(await client.getHostNumber()).trim();
     if (!hostNumber) return;
     clearDisconnectTimer();
+    const recovered = !verifiedConnected;
     verifiedConnected = true;
-    post({ type: "state", state: "connected", hostNumber });
+    if (recovered) post({ type: "state", state: "connected", hostNumber });
   } catch {
+    if (verifiedConnected) verifiedConnected = false;
     scheduleDisconnected();
   }
+}
+
+function startConnectionVerifier(): void {
+  stopConnectionVerifier();
+  connectionVerifier = setInterval(() => void confirmReconnected(), 5_000);
+  connectionVerifier.unref();
+}
+
+function startRealtimePoller(openwa: OpenWAClient): void {
+  stopRealtimePoller();
+  const poll = async () => {
+    if (!verifiedConnected || realtimePolling) return;
+    realtimePolling = true;
+    try {
+      const messages = (await openwa.evaluateScript<Array<Record<string, unknown>>>(RECENT_MESSAGES_SCRIPT)) || [];
+      const currentIds = new Set(messages.map((message) => String(message.id || "")).filter(Boolean));
+      if (!realtimeInitialized) {
+        seenRealtimeMessageIds = currentIds;
+        realtimeInitialized = true;
+        return;
+      }
+      for (const message of messages) {
+        const messageId = String(message.id || "");
+        if (!messageId || seenRealtimeMessageIds.has(messageId)) continue;
+        seenRealtimeMessageIds.add(messageId);
+        post({ type: "event", eventName: "message", payload: message });
+      }
+      if (seenRealtimeMessageIds.size > 3000) seenRealtimeMessageIds = currentIds;
+    } catch {
+      // O catalogo incremental do Norium continua sendo o fallback.
+    } finally {
+      realtimePolling = false;
+    }
+  };
+  void poll();
+  realtimePoller = setInterval(() => void poll(), 1_500);
+  realtimePoller.unref();
 }
 
 function startQrPoller(openwa: OpenWAClient): void {
@@ -565,6 +672,8 @@ channel.on("message", (message: InvokeMessage | ShutdownMessage) => {
   if (message?.type === "shutdown") {
     void (async () => {
       stopQrPoller();
+      stopRealtimePoller();
+      stopConnectionVerifier();
       clearDisconnectTimer();
       if (bootstrapRetryTimer) clearTimeout(bootstrapRetryTimer);
       bootstrapRetryTimer = null;
@@ -737,6 +846,8 @@ async function launch(): Promise<void> {
     });
     createdCore.events.on("session.logout", () => {
       clearDisconnectTimer();
+      stopRealtimePoller();
+      stopConnectionVerifier();
       verifiedConnected = false;
       post({ type: "state", state: "disconnected" });
     });
@@ -761,11 +872,14 @@ async function launch(): Promise<void> {
     verifiedConnected = true;
     clearDisconnectTimer();
     stopQrPoller();
-    clearDisconnectTimer();
+    startConnectionVerifier();
+    startRealtimePoller(createdCore);
     post({ type: "state", state: "connected", hostNumber });
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "Falha ao iniciar OpenWA.";
     stopQrPoller();
+    stopRealtimePoller();
+    stopConnectionVerifier();
     verifiedConnected = false;
     client = null;
     await core?.stop("bootstrap_failed").catch(() => undefined);
