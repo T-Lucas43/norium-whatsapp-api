@@ -33,6 +33,7 @@ let core: OpenWAClient | null = null;
 let verifiedConnected = false;
 let qrPoller: NodeJS.Timeout | null = null;
 let disconnectTimer: NodeJS.Timeout | null = null;
+let bootstrapRetryTimer: NodeJS.Timeout | null = null;
 let lastPolledQr: string | null = null;
 
 const QR_SNAPSHOT_SCRIPT = `(() => {
@@ -398,6 +399,8 @@ channel.on("message", (message: InvokeMessage | ShutdownMessage) => {
     void (async () => {
       stopQrPoller();
       clearDisconnectTimer();
+      if (bootstrapRetryTimer) clearTimeout(bootstrapRetryTimer);
+      bootstrapRetryTimer = null;
       verifiedConnected = false;
       try {
         await core?.stop("Worker do Norium encerrado.");
@@ -471,6 +474,8 @@ channel.on("message", (message: InvokeMessage | ShutdownMessage) => {
 });
 
 async function launch(): Promise<void> {
+  if (bootstrapRetryTimer) clearTimeout(bootstrapRetryTimer);
+  bootstrapRetryTimer = null;
   post({ type: "state", state: "starting" });
   try {
     // The alpha ESM build resolves browser assets from a file:// stack path.
@@ -547,15 +552,24 @@ async function launch(): Promise<void> {
     clearDisconnectTimer();
     post({ type: "state", state: "connected", hostNumber });
   } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : "Falha ao iniciar OpenWA.";
     stopQrPoller();
     verifiedConnected = false;
     client = null;
     await core?.stop("bootstrap_failed").catch(() => undefined);
     core = null;
+    if (errorMessage.includes("QR scan took too long")) {
+      post({ type: "state", state: "starting" });
+      bootstrapRetryTimer = setTimeout(() => {
+        bootstrapRetryTimer = null;
+        void launch();
+      }, 1_500);
+      return;
+    }
     post({
       type: "state",
       state: "error",
-      error: error instanceof Error ? error.message.slice(0, 500) : "Falha ao iniciar OpenWA.",
+      error: errorMessage.slice(0, 500),
     });
   }
 }
