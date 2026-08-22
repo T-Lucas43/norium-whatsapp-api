@@ -29,9 +29,6 @@ param noriumWebhookUrl string
 @description('Origem web autorizada para chamadas de navegador.')
 param allowedOrigin string
 
-@description('Usuario do Norium que recebe as conversas desta sessao.')
-param noriumOwnerUserId string
-
 @secure()
 @minLength(32)
 param noriumApiKey string
@@ -178,23 +175,24 @@ resource containerApp 'Microsoft.App/containerApps@2025-01-01' = {
             { name: 'PERSISTENCE_BLOB_URL', secretRef: 'persistence-blob-url' }
             { name: 'PERSISTENCE_INTERVAL_SECONDS', value: '30' }
             { name: 'CHROME_PATH', value: '/usr/bin/chromium' }
+            { name: 'PUPPETEER_SKIP_DOWNLOAD', value: 'true' }
             { name: 'PUPPETEER_SKIP_CHROMIUM_DOWNLOAD', value: 'true' }
             { name: 'NORIUM_API_KEY', secretRef: 'norium-api-key' }
             { name: 'ADMIN_API_KEY', secretRef: 'admin-api-key' }
             { name: 'WEBHOOK_HMAC_SECRET', secretRef: 'webhook-hmac-secret' }
             { name: 'NORIUM_WEBHOOK_URL', value: noriumWebhookUrl }
             { name: 'NORIUM_WEBHOOK_SECRET', secretRef: 'norium-webhook-secret' }
-            { name: 'NORIUM_OWNER_USER_ID', value: noriumOwnerUserId }
             { name: 'ALLOWED_ORIGINS', value: allowedOrigin }
             { name: 'TRUST_PROXY', value: '1' }
             { name: 'RATE_LIMIT_PER_MINUTE', value: '120' }
             { name: 'SEND_RATE_LIMIT_PER_MINUTE', value: '30' }
+            { name: 'MAX_ACTIVE_SESSIONS', value: '8' }
             { name: 'MAX_BODY_MB', value: '25' }
             { name: 'LOG_LEVEL', value: 'info' }
           ]
           resources: {
-            cpu: json('1.0')
-            memory: '2Gi'
+            cpu: json('4.0')
+            memory: '8Gi'
           }
           probes: [
             {

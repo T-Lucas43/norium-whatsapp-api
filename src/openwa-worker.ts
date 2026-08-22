@@ -184,6 +184,37 @@ const CONTACT_CATALOG_SCRIPT = `(() => {
   }).filter((contact) => contact.id);
 })()`;
 
+function messageCatalogScript(chatId: string, before: number | null, limit: number): string {
+  return `(() => {
+    const chatId = ${JSON.stringify(chatId)};
+    const before = ${before === null ? "null" : String(before)};
+    const limit = ${limit};
+    const chat = window.Store?.Chat?.get?.(chatId)
+      || (window.Store?.Chat?.models || window.Store?.Chat?._models || []).find((item) => String(item?.id?._serialized || item?.id || '') === chatId);
+    const models = Array.isArray(chat?.msgs?.models) ? chat.msgs.models : (Array.isArray(chat?.msgs?._models) ? chat.msgs._models : []);
+    const timestampOf = (value) => Number(value?.t || value?.timestamp || value?.id?.t || 0) || 0;
+    const serializedId = (value) => String(value?._serialized || value?.id?._serialized || value || '');
+    const labelFor = (type) => ({ image: '[Imagem]', video: '[Video]', audio: '[Audio]', ptt: '[Audio]', document: '[Documento]', sticker: '[Figurinha]', location: '[Localizacao]', contact: '[Contato]', vcard: '[Contato]' }[String(type || '').toLowerCase()] || '[Mensagem]');
+    const eligible = models.filter((message) => !before || timestampOf(message) < before);
+    const selected = eligible.slice(-limit);
+    const items = selected.map((message) => {
+      const type = String(message?.type || 'chat');
+      return {
+        id: serializedId(message?.id) || ('history-' + chatId + '-' + timestampOf(message)),
+        fromMe: Boolean(message?.id?.fromMe || message?.fromMe),
+        timestamp: timestampOf(message),
+        content: String(message?.body || message?.caption || labelFor(type)).slice(0, 65536),
+        type,
+        senderName: String(message?.senderObj?.formattedName || message?.senderObj?.pushname || ''),
+        mimetype: String(message?.mimetype || message?.mediaData?.mimetype || ''),
+        filename: String(message?.filename || ''),
+        duration: Number(message?.duration || message?.mediaData?.duration || 0) || 0
+      };
+    }).filter((message) => message.timestamp > 0);
+    return { items, cursor: items.length ? items[0].timestamp : null, hasMore: eligible.length > selected.length };
+  })()`;
+}
+
 if (!channel) throw new Error("Canal IPC do OpenWA indisponivel.");
 
 function serializable(value: unknown): unknown {
@@ -248,7 +279,7 @@ function availableMethods(instance: Client): string[] {
 async function registerEvents(instance: Client): Promise<void> {
   const dynamic = instance as unknown as Record<string, unknown>;
   const listeners: Array<[string, string]> = [
-    ["onMessage", "message"], ["onAnyMessage", "any-message"], ["onAck", "ack"],
+    ["onAnyMessage", "message"], ["onAck", "ack"],
     ["onAddedToGroup", "group-added"], ["onParticipantsChanged", "group-participants"],
     ["onIncomingCall", "incoming-call"], ["onButton", "button"],
     ["onPollVote", "poll-vote"], ["onReaction", "reaction"],
@@ -282,6 +313,16 @@ channel.on("message", (message: InvokeMessage) => {
       if (message.method === "__noriumContactCatalog") {
         if (!core) throw new Error("Runtime do WhatsApp indisponivel.");
         const result = await core.evaluateScript<unknown[]>(CONTACT_CATALOG_SCRIPT);
+        post({ type: "response", id: message.id, ok: true, result });
+        return;
+      }
+      if (message.method === "__noriumMessages") {
+        if (!core) throw new Error("Runtime do WhatsApp indisponivel.");
+        const chatId = String(message.args?.[0] || "");
+        const beforeValue = Number(message.args?.[1] || 0);
+        const before = Number.isFinite(beforeValue) && beforeValue > 0 ? beforeValue : null;
+        const limit = Math.max(1, Math.min(100, Number(message.args?.[2] || 50)));
+        const result = await core.evaluateScript<Record<string, unknown>>(messageCatalogScript(chatId, before, limit));
         post({ type: "response", id: message.id, ok: true, result });
         return;
       }

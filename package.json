@@ -11,6 +11,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
     "lint": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test dist/session-manager.test.js",
     "audit:prod": "npm audit --omit=dev --audit-level=high"
   },
   "dependencies": {
@@ -34,6 +35,11 @@
     "typescript": "5.9.2"
   },
   "overrides": {
+    "deepmerge-ts": "8.0.2",
+    "puppeteer": "25.8.0",
+    "puppeteer-core": "25.8.0",
+    "@puppeteer/browsers": "3.2.1",
+    "uuid": "14.0.2",
     "parse-url": "8.1.0",
     "@open-wa/wa-decrypt": {
       "axios": "1.19.0"

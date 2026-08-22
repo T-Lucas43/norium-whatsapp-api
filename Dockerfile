@@ -14,6 +14,7 @@ ENV NODE_ENV=production \
     SESSION_DATA_PATH=/data/sessions \
     OUTBOX_PATH=/data/outbox \
     CHROME_PATH=/usr/bin/chromium \
+    PUPPETEER_SKIP_DOWNLOAD=true \
     PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium ca-certificates dumb-init fonts-liberation fonts-noto-color-emoji zstd \

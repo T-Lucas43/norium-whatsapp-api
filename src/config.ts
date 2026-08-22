@@ -22,7 +22,7 @@ mkdirSync(sessionDataPath, { recursive: true, mode: 0o700 });
 export const config = {
   environment: process.env.NODE_ENV || "development",
   port: integerEnv("PORT", 8080, 1, 65535),
-  sessionId: (process.env.SESSION_ID || "norium").replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 80),
+  legacySessionId: (process.env.SESSION_ID || "norium").replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 80),
   sessionDataPath,
   sessionFormatVersion: (process.env.SESSION_FORMAT_VERSION || "openwa5-v2").trim(),
   persistenceRoot,
@@ -37,6 +37,7 @@ export const config = {
   trustProxy: integerEnv("TRUST_PROXY", 1, 0, 3),
   rateLimitPerMinute: integerEnv("RATE_LIMIT_PER_MINUTE", 120, 10, 2000),
   sendRateLimitPerMinute: integerEnv("SEND_RATE_LIMIT_PER_MINUTE", 30, 1, 600),
+  maxActiveSessions: integerEnv("MAX_ACTIVE_SESSIONS", 8, 1, 50),
   maxBodyMb: integerEnv("MAX_BODY_MB", 25, 1, 48),
   allowedOrigins: (process.env.ALLOWED_ORIGINS || "")
     .split(",")

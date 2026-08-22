@@ -10,12 +10,15 @@ type WebhookEnvelope = {
   occurredAt: string;
   data: unknown;
   attempts: number;
+  userId: string;
 };
+
+type SessionContext = { userId: string; sessionId: string };
 
 const sleep = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 function safePayload(event: string, data: unknown): unknown {
-  if (event !== "message" || typeof data !== "object" || data === null) return data;
+  if (!["message", "any-message"].includes(event) || typeof data !== "object" || data === null) return data;
   const message = data as Record<string, unknown>;
   const sender = typeof message.sender === "object" && message.sender !== null
     ? message.sender as Record<string, unknown>
@@ -41,17 +44,17 @@ function safePayload(event: string, data: unknown): unknown {
     mimetype: message.mimetype,
     filename: message.filename,
     duration: message.duration,
-    userId: process.env.NORIUM_OWNER_USER_ID || undefined,
   };
 }
 
 export class WebhookDispatcher {
-  async enqueue(event: string, data: unknown): Promise<void> {
+  async enqueue(context: SessionContext, event: string, data: unknown): Promise<void> {
     if (!config.noriumWebhookUrl) return;
     const envelope: WebhookEnvelope = {
       id: randomUUID(),
       event,
-      sessionId: config.sessionId,
+      sessionId: context.sessionId,
+      userId: context.userId,
       occurredAt: new Date().toISOString(),
       data: safePayload(event, data),
       attempts: 0,
@@ -78,9 +81,14 @@ export class WebhookDispatcher {
     }
 
     for (let attempt = envelope.attempts; attempt < 6; attempt += 1) {
-      const bodyPayload = envelope.event === "message"
-        ? envelope.data
-        : { event: envelope.event, eventId: envelope.id, occurredAt: envelope.occurredAt, data: envelope.data };
+      const bodyPayload = {
+        event: envelope.event,
+        eventId: envelope.id,
+        sessionId: envelope.sessionId,
+        userId: envelope.userId,
+        occurredAt: envelope.occurredAt,
+        data: envelope.data,
+      };
       const body = JSON.stringify(bodyPayload);
       const timestamp = Math.floor(Date.now() / 1000).toString();
       const signature = createHmac("sha256", config.webhookHmacSecret)
