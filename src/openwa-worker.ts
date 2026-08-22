@@ -390,6 +390,70 @@ function messageCatalogScript(chatId: string, before: number | null, limit: numb
   })()`;
 }
 
+function mediaMessageScript(messageId: string, chatId: string | null): string {
+  return `(async () => {
+    const messageId = ${JSON.stringify(messageId)};
+    const chatId = ${JSON.stringify(chatId)};
+    const modelsOf = (collection) => Array.isArray(collection?.models)
+      ? collection.models
+      : (Array.isArray(collection?._models) ? collection._models : []);
+    const serializedId = (value) => String(value?._serialized || value?.id?._serialized || value || '');
+    const findIn = (collection) => modelsOf(collection).find((item) => serializedId(item?.id) === messageId);
+    const chats = modelsOf(window.Store?.Chat);
+    const targetChat = chatId
+      ? (window.Store?.Chat?.get?.(chatId) || chats.find((item) => serializedId(item?.id) === chatId))
+      : null;
+    const findMessage = () => window.Store?.Msg?.get?.(messageId)
+      || findIn(window.Store?.Msg)
+      || findIn(targetChat?.msgs)
+      || chats.map((chat) => findIn(chat?.msgs)).find(Boolean)
+      || null;
+
+    let message = findMessage();
+    if (!message && targetChat && typeof targetChat.loadEarlierMsgs === 'function') {
+      for (let attempt = 0; attempt < 8 && !message; attempt += 1) {
+        const loaded = await targetChat.loadEarlierMsgs();
+        message = findMessage();
+        if (!loaded || (Array.isArray(loaded) && loaded.length === 0)) break;
+      }
+    }
+    if (!message) return null;
+
+    const read = (source, key) => source?.[key]
+      ?? source?.['__x_' + key]
+      ?? source?.attributes?.[key]
+      ?? undefined;
+    const mediaData = read(message, 'mediaData') || {};
+    const type = String(read(message, 'type') || read(mediaData, 'type') || 'document').toLowerCase();
+    const mimeFallback = ({ image: 'image/jpeg', video: 'video/mp4', audio: 'audio/ogg', ptt: 'audio/ogg', document: 'application/octet-stream', sticker: 'image/webp' })[type]
+      || 'application/octet-stream';
+    const directPath = String(read(message, 'directPath') || read(mediaData, 'directPath') || '');
+    let clientUrl = String(
+      read(message, 'clientUrl')
+      || read(message, 'deprecatedMms3Url')
+      || read(mediaData, 'clientUrl')
+      || read(mediaData, 'deprecatedMms3Url')
+      || ''
+    );
+    if (!clientUrl && directPath) clientUrl = directPath.startsWith('http') ? directPath : 'https://mmg.whatsapp.net' + directPath;
+    const mediaKey = read(message, 'mediaKey') || read(mediaData, 'mediaKey');
+    const filehash = read(message, 'filehash') || read(mediaData, 'filehash') || read(message, 'uploadhash') || read(mediaData, 'uploadhash');
+    const size = Number(read(message, 'size') || read(mediaData, 'size') || read(mediaData, 'fileSize') || 0) || undefined;
+    return {
+      id: messageId,
+      type,
+      mimetype: String(read(message, 'mimetype') || read(mediaData, 'mimetype') || mimeFallback),
+      mediaKey,
+      filehash,
+      uploadhash: read(message, 'uploadhash') || read(mediaData, 'uploadhash'),
+      size,
+      clientUrl,
+      deprecatedMms3Url: clientUrl,
+      directPath
+    };
+  })()`;
+}
+
 if (!channel) throw new Error("Canal IPC do OpenWA indisponivel.");
 
 function serializable(value: unknown): unknown {
@@ -560,6 +624,16 @@ channel.on("message", (message: InvokeMessage | ShutdownMessage) => {
         const before = Number.isFinite(beforeValue) && beforeValue > 0 ? beforeValue : null;
         const limit = Math.max(1, Math.min(100, Number(message.args?.[2] || 50)));
         const result = await core.evaluateScript<Record<string, unknown>>(messageCatalogScript(chatId, before, limit));
+        post({ type: "response", id: message.id, ok: true, result });
+        return;
+      }
+      if (message.method === "__noriumMedia") {
+        if (!core) throw new Error("Runtime do WhatsApp indisponivel.");
+        const messageId = String(message.args?.[0] || "");
+        const chatId = typeof message.args?.[1] === "string" ? String(message.args[1]) : null;
+        const mediaMessage = await core.evaluateScript<Record<string, unknown> | null>(mediaMessageScript(messageId, chatId));
+        if (!mediaMessage) throw new Error("Midia nao encontrada no historico carregado do WhatsApp.");
+        const result = await client.decryptMedia(mediaMessage as never);
         post({ type: "response", id: message.id, ok: true, result });
         return;
       }

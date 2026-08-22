@@ -85,6 +85,9 @@ const historyQuery = z.object({
   before: z.coerce.number().int().positive().optional(),
   limit: z.coerce.number().int().min(1).max(100).default(50),
 });
+const mediaQuery = z.object({
+  chatId: z.string().trim().min(5).max(120).optional(),
+});
 const groupPayload = z.object({
   name: z.string().trim().min(1).max(100),
   participants: z.array(z.string().min(5).max(80)).min(1).max(256),
@@ -263,7 +266,13 @@ app.post("/v1/messages/:id/reactions", requireRole("norium"), requireSessionCont
 });
 
 app.get("/v1/messages/:id/media", requireRole("norium"), requireSessionContext, async (request, response) => {
-  const result = await sessions.invoke<unknown>(requestSessionContext(request), "decryptMedia", [String(request.params.id || "")], 60_000);
+  const query = mediaQuery.parse(request.query);
+  const result = await sessions.invoke<unknown>(
+    requestSessionContext(request),
+    "__noriumMedia",
+    [String(request.params.id || ""), query.chatId ? normalizeChatId(query.chatId) : null],
+    60_000,
+  );
   const data = typeof result === "string"
     ? result
     : result && typeof result === "object" && typeof (result as Record<string, unknown>).data === "string"
