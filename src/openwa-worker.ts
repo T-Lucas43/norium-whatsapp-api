@@ -28,6 +28,7 @@ let client: Client | null = null;
 let core: OpenWAClient | null = null;
 let verifiedConnected = false;
 let qrPoller: NodeJS.Timeout | null = null;
+let disconnectTimer: NodeJS.Timeout | null = null;
 let lastPolledQr: string | null = null;
 
 const QR_SNAPSHOT_SCRIPT = `(() => {
@@ -179,10 +180,76 @@ const CONTACT_CATALOG_SCRIPT = `(() => {
       formattedName: String(contact?.formattedName || ''),
       verifiedName: String(contact?.verifiedName || ''),
       pushname: String(contact?.pushname || ''),
-      photoUrl: String(photo?.eurl || photo?.imgFull || photo?.img || '')
+      photoUrl: String(photo?.eurl || photo?.imgFull || photo?.img || ''),
+      bio: String(contact?.status?.status || contact?.status?.text || contact?.status || contact?.about || ''),
+      isBusiness: Boolean(contact?.isBusiness || contact?.isEnterprise),
+      isMyContact: Boolean(contact?.isMyContact),
+      isBlocked: Boolean(contact?.isBlocked)
     };
   }).filter((contact) => contact.id);
 })()`;
+
+function contactDetailsScript(contactId: string): string {
+  return `(() => {
+    const contactId = ${JSON.stringify(contactId)};
+    const contact = window.Store?.Contact?.get?.(contactId)
+      || (window.Store?.Contact?.models || window.Store?.Contact?._models || [])
+        .find((item) => String(item?.id?._serialized || item?.id || '') === contactId);
+    if (!contact) return null;
+    const id = String(contact?.id?._serialized || contact?.id || contactId);
+    const photo = contact?.profilePicThumb || {};
+    return {
+      id,
+      phone: id,
+      name: String(contact?.formattedName || contact?.name || contact?.pushname || id),
+      formattedName: String(contact?.formattedName || ''),
+      pushname: String(contact?.pushname || ''),
+      verifiedName: String(contact?.verifiedName || ''),
+      photoUrl: String(photo?.eurl || photo?.imgFull || photo?.img || ''),
+      bio: String(contact?.status?.status || contact?.status?.text || contact?.status || contact?.about || ''),
+      isBusiness: Boolean(contact?.isBusiness || contact?.isEnterprise),
+      isMyContact: Boolean(contact?.isMyContact),
+      isBlocked: Boolean(contact?.isBlocked)
+    };
+  })()`;
+}
+
+function groupDetailsScript(groupId: string): string {
+  return `(() => {
+    const groupId = ${JSON.stringify(groupId)};
+    const serializedId = (value) => String(value?._serialized || value?.id?._serialized || value || '');
+    const modelsOf = (collection) => Array.isArray(collection?.models)
+      ? collection.models
+      : (Array.isArray(collection?._models) ? collection._models : []);
+    const chat = window.Store?.Chat?.get?.(groupId)
+      || modelsOf(window.Store?.Chat).find((item) => serializedId(item?.id) === groupId);
+    if (!chat) return null;
+    const metadata = chat?.groupMetadata || {};
+    const photo = chat?.contact?.profilePicThumb || {};
+    const participants = modelsOf(metadata?.participants).map((participant) => {
+      const id = serializedId(participant?.id || participant?.contact?.id);
+      const contact = participant?.contact || window.Store?.Contact?.get?.(id) || {};
+      return {
+        id,
+        phone: id,
+        name: String(contact?.formattedName || contact?.name || contact?.pushname || id),
+        isAdmin: Boolean(participant?.isAdmin),
+        isSuperAdmin: Boolean(participant?.isSuperAdmin)
+      };
+    }).filter((participant) => participant.id);
+    return {
+      id: groupId,
+      subject: String(metadata?.subject || chat?.formattedTitle || chat?.name || groupId),
+      name: String(metadata?.subject || chat?.formattedTitle || chat?.name || groupId),
+      description: String(metadata?.desc || metadata?.description || ''),
+      owner: serializedId(metadata?.owner),
+      createdAt: Number(metadata?.creation || metadata?.createdAt || 0) || null,
+      participants,
+      participantCount: participants.length,
+      photoUrl: String(photo?.eurl || photo?.imgFull || photo?.img || '')
+    };
+  })()`;
+}
 
 function messageCatalogScript(chatId: string, before: number | null, limit: number): string {
   return `(() => {
@@ -229,6 +296,33 @@ function post(message: Record<string, unknown>): void {
 function stopQrPoller(): void {
   if (qrPoller) clearInterval(qrPoller);
   qrPoller = null;
+}
+
+function clearDisconnectTimer(): void {
+  if (disconnectTimer) clearTimeout(disconnectTimer);
+  disconnectTimer = null;
+}
+
+function scheduleDisconnected(): void {
+  clearDisconnectTimer();
+  disconnectTimer = setTimeout(() => {
+    disconnectTimer = null;
+    if (!verifiedConnected) post({ type: "state", state: "disconnected" });
+  }, 12_000);
+  disconnectTimer.unref();
+}
+
+async function confirmReconnected(): Promise<void> {
+  if (verifiedConnected || !client) return;
+  try {
+    const hostNumber = String(await client.getHostNumber()).trim();
+    if (!hostNumber) return;
+    clearDisconnectTimer();
+    verifiedConnected = true;
+    post({ type: "state", state: "connected", hostNumber });
+  } catch {
+    scheduleDisconnected();
+  }
 }
 
 function startQrPoller(openwa: OpenWAClient): void {
@@ -316,6 +410,18 @@ channel.on("message", (message: InvokeMessage) => {
         post({ type: "response", id: message.id, ok: true, result });
         return;
       }
+      if (message.method === "__noriumContactDetails") {
+        if (!core) throw new Error("Runtime do WhatsApp indisponivel.");
+        const result = await core.evaluateScript<Record<string, unknown> | null>(contactDetailsScript(String(message.args?.[0] || "")));
+        post({ type: "response", id: message.id, ok: true, result });
+        return;
+      }
+      if (message.method === "__noriumGroupDetails") {
+        if (!core) throw new Error("Runtime do WhatsApp indisponivel.");
+        const result = await core.evaluateScript<Record<string, unknown> | null>(groupDetailsScript(String(message.args?.[0] || "")));
+        post({ type: "response", id: message.id, ok: true, result });
+        return;
+      }
       if (message.method === "__noriumMessages") {
         if (!core) throw new Error("Runtime do WhatsApp indisponivel.");
         const chatId = String(message.args?.[0] || "");
@@ -379,17 +485,22 @@ async function launch(): Promise<void> {
     });
     createdCore.events.on("session.state.changed", (event: OpenWAEvent<{ next?: string }>) => {
       const next = String(event.details?.next || "").toUpperCase();
+      if (next === "READY" || next === "CONNECTED") {
+        void confirmReconnected();
+        return;
+      }
       if (verifiedConnected && (next === "DISCONNECTED" || next === "STOPPED")) {
         verifiedConnected = false;
-        post({ type: "state", state: "disconnected" });
+        scheduleDisconnected();
       }
     });
     createdCore.events.on("session.connection.disconnected", () => {
       if (!verifiedConnected) return;
       verifiedConnected = false;
-      post({ type: "state", state: "disconnected" });
+      scheduleDisconnected();
     });
     createdCore.events.on("session.logout", () => {
+      clearDisconnectTimer();
       verifiedConnected = false;
       post({ type: "state", state: "disconnected" });
     });
@@ -402,8 +513,9 @@ async function launch(): Promise<void> {
     await createdClient.start();
     await createdClient.loaded();
 
-    if (createdClient.getState() !== "READY") {
-      throw new Error(`OpenWA finalizou sem prontidao confirmada (${createdClient.getState()}).`);
+    const authenticatedState = String(createdClient.getState() || "").toUpperCase();
+    if (!["READY", "CONNECTED"].includes(authenticatedState)) {
+      throw new Error(`OpenWA finalizou sem prontidao confirmada (${authenticatedState || "desconhecido"}).`);
     }
     const hostNumber = String(await createdClient.getHostNumber()).trim();
     if (!hostNumber) throw new Error("OpenWA nao confirmou o numero autenticado.");
@@ -411,7 +523,9 @@ async function launch(): Promise<void> {
     client = createdClient;
     await registerEvents(createdClient);
     verifiedConnected = true;
+    clearDisconnectTimer();
     stopQrPoller();
+    clearDisconnectTimer();
     post({ type: "state", state: "connected", hostNumber });
   } catch (error) {
     stopQrPoller();

@@ -1,4 +1,6 @@
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { existsSync } from "node:fs";
+import { mkdir, unlink, writeFile } from "node:fs/promises";
 import { Worker } from "node:worker_threads";
 import QRCode from "qrcode";
 import { config } from "./config.js";
@@ -25,6 +27,7 @@ type SessionRuntime = SessionContext & {
   requestSequence: number;
   requests: Map<number, PendingRequest>;
   lastUsedAt: number;
+  nextLaunchAt: number;
 };
 
 export type SessionStatus = {
@@ -52,7 +55,7 @@ export class WhatsAppSessionManager {
   ) {}
 
   status(context: SessionContext, start = true): SessionStatus {
-    const runtime = this.ensure(context, start);
+    const runtime = this.ensure(context, start || this.shouldResume(context));
     return this.publicStatus(runtime);
   }
 
@@ -98,7 +101,9 @@ export class WhatsAppSessionManager {
   }
 
   async reconnect(context: SessionContext): Promise<SessionStatus> {
+    await unlink(this.disabledMarker(context)).catch(() => undefined);
     const runtime = this.ensure(context, false);
+    runtime.nextLaunchAt = 0;
     if (runtime.worker && ["starting", "qr", "connected"].includes(runtime.state)) {
       return this.publicStatus(runtime);
     }
@@ -117,6 +122,9 @@ export class WhatsAppSessionManager {
     runtime.connectedAt = null;
     runtime.hostNumber = null;
     runtime.lastError = null;
+    const marker = this.disabledMarker(context);
+    await mkdir(dirname(marker), { recursive: true, mode: 0o700 });
+    await writeFile(marker, new Date().toISOString(), { mode: 0o600 });
     await this.persistence.save().catch((error) => this.logger.warn({ err: error }, "Falha ao persistir logout"));
   }
 
@@ -133,7 +141,7 @@ export class WhatsAppSessionManager {
         throw error;
       }
       existing.lastUsedAt = Date.now();
-      if (start && !existing.worker && !existing.launchPromise && existing.state !== "disconnected") {
+      if (start && !existing.worker && !existing.launchPromise && Date.now() >= existing.nextLaunchAt) {
         existing.launchPromise = this.launch(existing);
       }
       return existing;
@@ -163,6 +171,7 @@ export class WhatsAppSessionManager {
       requestSequence: 0,
       requests: new Map(),
       lastUsedAt: Date.now(),
+      nextLaunchAt: 0,
     };
     this.sessions.set(context.sessionId, runtime);
     if (start) runtime.launchPromise = this.launch(runtime);
@@ -178,6 +187,23 @@ export class WhatsAppSessionManager {
       hostNumber: runtime.hostNumber,
       lastError: runtime.lastError,
     };
+  }
+
+  private sessionRoot(context: SessionContext): string {
+    return context.sessionId === config.legacySessionId
+      ? config.sessionDataPath
+      : join(config.sessionDataPath, context.sessionId);
+  }
+
+  private disabledMarker(context: SessionContext): string {
+    return context.sessionId === config.legacySessionId
+      ? join(config.sessionDataPath, `.norium-disabled-${context.sessionId}`)
+      : join(this.sessionRoot(context), ".norium-disabled");
+  }
+
+  private shouldResume(context: SessionContext): boolean {
+    if (existsSync(this.disabledMarker(context))) return false;
+    return existsSync(join(this.sessionRoot(context), `_IGNORE_${context.sessionId}`));
   }
 
   private rejectRequests(runtime: SessionRuntime, message: string): void {
@@ -202,11 +228,10 @@ export class WhatsAppSessionManager {
     runtime.latestQr = null;
     runtime.hostNumber = null;
     try {
-      const legacySession = runtime.sessionId === config.legacySessionId;
       const worker = new Worker(new URL("./openwa-worker.js", import.meta.url), {
         workerData: {
           sessionId: runtime.sessionId,
-          sessionDataPath: legacySession ? config.sessionDataPath : join(config.sessionDataPath, runtime.sessionId),
+          sessionDataPath: this.sessionRoot(runtime),
           chromePath: config.chromePath,
         },
       });
@@ -251,16 +276,22 @@ export class WhatsAppSessionManager {
             runtime.lastError = null;
             runtime.connectedAt = new Date().toISOString();
             runtime.hostNumber = String(message.hostNumber || "") || null;
+            runtime.nextLaunchAt = 0;
+            void unlink(this.disabledMarker(runtime)).catch(() => undefined);
             void this.persistence.save().catch((error) => this.logger.warn({ err: error }, "Falha ao persistir sessao conectada"));
             void this.dispatcher.enqueue(runtime, "session-ready", { connectedAt: runtime.connectedAt });
           } else if (state === "disconnected") {
             runtime.state = "disconnected";
             runtime.latestQr = null;
+            runtime.nextLaunchAt = Date.now() + 5_000;
+            void this.stop(runtime, "Conexao do WhatsApp interrompida.");
           } else {
             runtime.state = "error";
             runtime.latestQr = null;
             runtime.lastError = String(message.error || "Falha ao iniciar OpenWA.").slice(0, 500);
+            runtime.nextLaunchAt = Date.now() + 10_000;
             this.logger.error({ sessionId: runtime.sessionId, workerError: runtime.lastError }, "OpenWA nao iniciou");
+            void this.stop(runtime, runtime.lastError);
           }
           return;
         }
@@ -274,6 +305,7 @@ export class WhatsAppSessionManager {
         runtime.state = "error";
         runtime.latestQr = null;
         runtime.lastError = error.message.slice(0, 500);
+        runtime.nextLaunchAt = Date.now() + 10_000;
         this.rejectRequests(runtime, "Processo do WhatsApp falhou.");
         this.logger.error({ err: error, sessionId: runtime.sessionId }, "Worker OpenWA falhou");
       });
@@ -285,11 +317,13 @@ export class WhatsAppSessionManager {
           runtime.state = "error";
           runtime.latestQr = null;
           runtime.lastError = `Processo OpenWA encerrado com codigo ${code}.`;
+          runtime.nextLaunchAt = Date.now() + 10_000;
         }
       });
     } catch (error) {
       runtime.state = "error";
       runtime.lastError = error instanceof Error ? error.message.slice(0, 500) : "Falha ao iniciar OpenWA.";
+      runtime.nextLaunchAt = Date.now() + 10_000;
       this.logger.error({ err: error, sessionId: runtime.sessionId }, "OpenWA nao iniciou");
     } finally {
       runtime.launchPromise = null;

@@ -254,6 +254,11 @@ app.delete("/v1/chats/:id", requireRole("norium"), requireSessionContext, requir
   response.json({ deleted: Boolean(deleted) });
 });
 app.get("/v1/contacts", requireRole("norium"), requireSessionContext, async (request, response) => response.json(await sessions.invoke(requestSessionContext(request), "__noriumContactCatalog", [], 20_000)));
+app.get("/v1/contacts/:id", requireRole("norium"), requireSessionContext, async (request, response) => {
+  const value = await sessions.invoke(requestSessionContext(request), "__noriumContactDetails", [String(request.params.id || "")], 20_000);
+  if (!value) return response.status(404).json({ error: "Contato nao encontrado." });
+  return response.json(value);
+});
 app.get("/v1/groups", requireRole("norium"), requireSessionContext, async (request, response) => {
   const chats = await sessions.invoke<any[]>(requestSessionContext(request), "__noriumChatCatalog", [], 20_000);
   response.json(chats.filter((chat: any) => Boolean(chat.isGroup || String(chat.id || "").endsWith("@g.us"))));
@@ -265,7 +270,9 @@ app.get("/v1/contacts/:id/profile-picture", requireRole("norium"), requireSessio
 });
 app.get("/v1/groups/:id", requireRole("norium"), requireSessionContext, async (request, response) => {
   const groupId = normalizeChatId(String(request.params.id || ""));
-  response.json(await sessions.invoke(requestSessionContext(request), "getGroupInfo", [groupId]));
+  const value = await sessions.invoke(requestSessionContext(request), "__noriumGroupDetails", [groupId], 20_000);
+  if (!value) return response.status(404).json({ error: "Grupo nao encontrado." });
+  return response.json(value);
 });
 app.post("/v1/groups", requireRole("norium"), requireSessionContext, async (request, response) => {
   const body = groupPayload.parse(request.body);
