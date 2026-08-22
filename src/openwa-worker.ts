@@ -16,6 +16,10 @@ type InvokeMessage = {
   args: unknown[];
 };
 
+type ShutdownMessage = {
+  type: "shutdown";
+};
+
 type OpenWAEvent<T = Record<string, unknown>> = {
   details?: T;
   error?: { message?: string };
@@ -389,7 +393,22 @@ async function registerEvents(instance: Client): Promise<void> {
   }
 }
 
-channel.on("message", (message: InvokeMessage) => {
+channel.on("message", (message: InvokeMessage | ShutdownMessage) => {
+  if (message?.type === "shutdown") {
+    void (async () => {
+      stopQrPoller();
+      clearDisconnectTimer();
+      verifiedConnected = false;
+      try {
+        await core?.stop("Worker do Norium encerrado.");
+      } catch {
+        // O processo pai ainda encerra o worker caso o navegador nao responda.
+      } finally {
+        post({ type: "shutdown-complete" });
+      }
+    })();
+    return;
+  }
   if (message?.type !== "invoke") return;
   void (async () => {
     try {

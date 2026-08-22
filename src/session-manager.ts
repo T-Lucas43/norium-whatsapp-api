@@ -1,6 +1,6 @@
 import { dirname, join } from "node:path";
 import { existsSync } from "node:fs";
-import { mkdir, unlink, writeFile } from "node:fs/promises";
+import { mkdir, rm, unlink, writeFile } from "node:fs/promises";
 import { Worker } from "node:worker_threads";
 import QRCode from "qrcode";
 import { config } from "./config.js";
@@ -214,15 +214,43 @@ export class WhatsAppSessionManager {
     runtime.requests.clear();
   }
 
+  private async clearBrowserProfileLocks(runtime: SessionRuntime): Promise<void> {
+    const profileRoot = join(this.sessionRoot(runtime), `_IGNORE_${runtime.sessionId}`);
+    const transientFiles = ["SingletonCookie", "SingletonLock", "SingletonSocket", "DevToolsActivePort"];
+    await Promise.all(transientFiles.map((name) => rm(join(profileRoot, name), { force: true, recursive: true })));
+  }
+
   private async stop(runtime: SessionRuntime, reason: string): Promise<void> {
     const target = runtime.worker;
     runtime.worker = null;
     this.rejectRequests(runtime, reason);
-    if (target) await target.terminate().catch(() => undefined);
+    if (target) {
+      await new Promise<void>((resolve) => {
+        let finished = false;
+        const finish = () => {
+          if (finished) return;
+          finished = true;
+          clearTimeout(timer);
+          target.off("message", onMessage);
+          target.off("exit", finish);
+          resolve();
+        };
+        const onMessage = (message: Record<string, unknown>) => {
+          if (message?.type === "shutdown-complete") finish();
+        };
+        const timer = setTimeout(finish, 5_000);
+        timer.unref();
+        target.on("message", onMessage);
+        target.once("exit", finish);
+        target.postMessage({ type: "shutdown" });
+      });
+      await target.terminate().catch(() => undefined);
+    }
   }
 
   private async launch(runtime: SessionRuntime): Promise<void> {
     await this.stop(runtime, "Processo do WhatsApp reiniciado.");
+    await this.clearBrowserProfileLocks(runtime);
     runtime.state = "starting";
     runtime.lastError = null;
     runtime.latestQr = null;
