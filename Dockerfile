@@ -1,4 +1,4 @@
-FROM node:22-bookworm-slim AS build
+FROM node:22.22.2-bookworm-slim AS build
 WORKDIR /src
 COPY package*.json ./
 RUN npm install
@@ -6,7 +6,7 @@ COPY tsconfig.json ./
 COPY src ./src
 RUN npm run build && npm prune --omit=dev
 
-FROM node:22-bookworm-slim
+FROM node:22.22.2-bookworm-slim
 USER root
 WORKDIR /app
 ENV NODE_ENV=production \

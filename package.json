@@ -5,7 +5,7 @@
   "description": "API privada e endurecida para integrar OpenWA ao Norium.",
   "type": "module",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.22.2"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -14,7 +14,9 @@
     "audit:prod": "npm audit --omit=dev --audit-level=high"
   },
   "dependencies": {
-    "@open-wa/wa-automate": "4.76.0",
+    "@open-wa/client": "5.0.0-alpha.8",
+    "@open-wa/core": "5.0.0-alpha.8",
+    "@open-wa/driver-puppeteer": "5.0.0-alpha.8",
     "cors": "2.8.5",
     "express": "5.1.0",
     "express-rate-limit": "8.6.2",

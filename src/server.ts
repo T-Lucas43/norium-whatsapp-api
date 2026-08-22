@@ -320,7 +320,7 @@ async function launchWhatsApp(): Promise<void> {
   lastError = null;
   latestQr = null;
   try {
-    // OpenWA 4 performs synchronous bootstrap work. Keeping it in a worker
+    // OpenWA performs synchronous browser/bootstrap work. Keeping it in a worker
     // prevents Chromium/session failures from blocking health checks or the API.
     const worker = new Worker(new URL("./openwa-worker.js", import.meta.url), {
       workerData: {
@@ -359,7 +359,10 @@ async function launchWhatsApp(): Promise<void> {
       }
       if (message.type === "state") {
         const state = String(message.state || "error");
-        if (state === "connected") {
+        if (state === "starting") {
+          sessionState = "starting";
+          latestQr = null;
+        } else if (state === "connected") {
           sessionState = "connected";
           latestQr = null;
           lastError = null;

@@ -172,7 +172,7 @@ resource containerApp 'Microsoft.App/containerApps@2025-01-01' = {
             { name: 'PORT', value: '8080' }
             { name: 'SESSION_ID', value: 'norium' }
             { name: 'SESSION_DATA_PATH', value: '/data/sessions' }
-            { name: 'SESSION_FORMAT_VERSION', value: 'openwa4-v1' }
+            { name: 'SESSION_FORMAT_VERSION', value: 'openwa5-v2' }
             { name: 'OUTBOX_PATH', value: '/data/outbox' }
             { name: 'PERSISTENCE_ROOT', value: '/data' }
             { name: 'PERSISTENCE_BLOB_URL', secretRef: 'persistence-blob-url' }

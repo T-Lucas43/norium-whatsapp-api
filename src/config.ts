@@ -24,7 +24,7 @@ export const config = {
   port: integerEnv("PORT", 8080, 1, 65535),
   sessionId: (process.env.SESSION_ID || "norium").replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 80),
   sessionDataPath,
-  sessionFormatVersion: (process.env.SESSION_FORMAT_VERSION || "openwa4-v1").trim(),
+  sessionFormatVersion: (process.env.SESSION_FORMAT_VERSION || "openwa5-v2").trim(),
   persistenceRoot,
   persistenceBlobUrl: (process.env.PERSISTENCE_BLOB_URL || "").trim(),
   persistenceIntervalMs: integerEnv("PERSISTENCE_INTERVAL_SECONDS", 30, 10, 300) * 1000,
