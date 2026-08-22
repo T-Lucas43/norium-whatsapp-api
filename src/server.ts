@@ -343,10 +343,11 @@ async function bootstrapWhatsApp(): Promise<void> {
   persistenceTimer.unref();
 }
 
+await bootstrapWhatsApp();
+void dispatcher.drain();
+
 const server = app.listen(config.port, "0.0.0.0", () => {
   logger.info({ port: config.port, maxActiveSessions: config.maxActiveSessions }, "Norium WhatsApp API pronta");
-  void dispatcher.drain();
-  void bootstrapWhatsApp();
 });
 
 async function shutdown(signal: string): Promise<void> {
